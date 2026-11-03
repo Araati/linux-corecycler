@@ -661,6 +661,15 @@ class TunerEngine(QObject):
 
         self._core_states = tp.load_core_states(self._db, session_id)
 
+        # Resume is the user's answer to a thermal pause (cooling fixed, limit
+        # raised): thermal retry streaks start fresh, or a session stopped at
+        # the cap would pause again on its first thermal stop.
+        self._validation_thermal_aborts = 0
+        for cs in self._core_states.values():
+            if cs.thermal_aborts:
+                cs.thermal_aborts = 0
+                tp.save_core_state(self._db, session_id, cs)
+
         # Rebuild the proven-safe envelope from the CO journal: a value the machine
         # survived in a prior boot of this session is still safe (silicon stability
         # does not vanish across a reboot). Cores with no survived row stay at the
@@ -2536,11 +2545,10 @@ class TunerEngine(QObject):
             if self._hunting:
                 self._validation_thermal_aborts += 1
                 if self._validation_thermal_aborts > self._config.max_thermal_retries:
-                    self.log_message.emit(
+                    self._pause_on_thermal(
                         "Crash hunt: thermal limit hit repeatedly — cooling cannot "
-                        "sustain hunting. Fix cooling, then Resume."
+                        "sustain hunting. Pausing; fix cooling, then Resume."
                     )
-                    self.abort()
                     return
                 self._hunt_queue.insert(0, core_id)
                 if self._session_id is not None:
@@ -2787,8 +2795,8 @@ class TunerEngine(QObject):
         state machine or logging a fail would push the offset the wrong way on a
         thermal transient. Instead: revert the core, defer it (cool down while
         other cores test), and retry the SAME offset. If a core keeps hitting the
-        limit, cooling cannot sustain the test — abort with a clear message rather
-        than silently producing a bad tune.
+        limit, cooling cannot sustain the test — pause (resumable) with a clear
+        message rather than silently producing a bad tune.
         """
         cs.thermal_aborts += 1
         if not self._revert_core_to_baseline(core_id):
@@ -2802,18 +2810,13 @@ class TunerEngine(QObject):
         self._accumulate_test_time(cs, duration)
 
         if cs.thermal_aborts > self._config.max_thermal_retries:
-            self.log_message.emit(
+            tp.save_core_state(self._db, self._session_id, cs)
+            self._pause_on_thermal(
                 f"Core {core_id}: thermal limit hit {cs.thermal_aborts} times at "
-                f"offset {cs.current_offset} — cooling cannot sustain testing. "
-                f"Lower load/ambient or improve cooling, then resume."
+                f"offset {cs.current_offset} (max_thermal_retries="
+                f"{self._config.max_thermal_retries}) — cooling cannot sustain "
+                f"testing. Pausing; lower load/ambient or improve cooling, then Resume."
             )
-            log.warning(
-                "Aborting tune: core %d hit thermal limit %d times (max_thermal_retries=%d)",
-                core_id,
-                cs.thermal_aborts,
-                self._config.max_thermal_retries,
-            )
-            self.abort()
             return
 
         cs.crash_cooldown = max(cs.crash_cooldown, 2)  # prefer other cores meanwhile
@@ -2828,25 +2831,40 @@ class TunerEngine(QObject):
         # core. QTimer also breaks the _on_test_finished call stack (re-entrancy).
         QTimer.singleShot(int(self._config.thermal_cooldown_seconds * 1000), self._run_next)
 
+    def _pause_on_thermal(self, message: str) -> None:
+        """Pause (resumable) after repeated thermal stops.
+
+        A thermal stop says nothing about stability: no offset moves and no
+        failure is recorded. Every core is reverted to baseline, as abort()
+        did, so no aggressive offset sits in the SMU while paused. A crash
+        hunt in progress is dropped, as abort() did; validation re-exposes the
+        instability after Resume.
+        """
+        self.log_message.emit(message)
+        log.warning("Pausing tune on thermal limit: %s", message)
+        self._revert_all_to_baseline()
+        if self._hunting:
+            self._hunting = False
+            self._hunt_queue = []
+            if self._session_id is not None:
+                tp.set_hunting_core(self._db, self._session_id, None)
+        self.pause()
+
     def _handle_validation_thermal_abort(self, core_id: int) -> None:
         """A thermal stop during validation is not a stability verdict.
 
         Backing off a confirmed core and restarting validation (the default
         fail path) on a thermal transient would degrade the tune. Instead: cool
         down and re-run the same validation stage. If the limit keeps tripping,
-        cooling cannot sustain the test — abort with a clear message.
+        cooling cannot sustain the test — pause (resumable) with a clear message.
         """
         self._validation_thermal_aborts += 1
         if self._validation_thermal_aborts > self._config.max_thermal_retries:
-            self.log_message.emit(
-                "Validation: thermal limit hit repeatedly — cooling cannot "
-                "sustain testing. Lower load/ambient or improve cooling, then resume."
+            self._pause_on_thermal(
+                f"Validation: thermal limit hit {self._validation_thermal_aborts} times "
+                f"— cooling cannot sustain testing. Pausing; lower load/ambient or "
+                f"improve cooling, then Resume."
             )
-            log.warning(
-                "Aborting validation: thermal limit hit %d times",
-                self._validation_thermal_aborts,
-            )
-            self.abort()
             return
         self.log_message.emit(
             f"Validation: core {core_id} thermal abort "

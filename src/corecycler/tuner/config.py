@@ -94,11 +94,11 @@ class TunerConfig:
 
     # Thermal safety (plumbed into the per-core scheduler). A thermal stop is
     # not a stability verdict: the tuner retries the same offset rather than
-    # recording a failure, up to max_thermal_retries, then aborts.
+    # recording a failure, up to max_thermal_retries, then pauses (resumable).
     max_temperature_c: float = 95.0  # stop a test if CPU exceeds this
     over_temp_grace_seconds: float = 3.0  # sustained over-limit time before stopping
     over_temp_hard_margin_c: float = 8.0  # instant stop at max + this (runaway)
-    max_thermal_retries: int = 3  # retry same offset this many times before aborting
+    max_thermal_retries: int = 3  # retry same offset this many times before pausing
     thermal_cooldown_seconds: float = 5.0  # real wall-clock cooldown before a thermal retry
 
     # An apparatus fault (stall, external kill, unattributable machine check)

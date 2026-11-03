@@ -84,3 +84,16 @@ class TestMaxTemperatureSource:
         assert tab._get_config().max_temperature_c == TunerConfig().max_temperature_c
         tab.set_max_temperature_source(lambda: 100.0)
         assert tab._get_config().max_temperature_c == 100.0
+
+
+class TestThermalRetriesSetting:
+    def test_thermal_retries_round_trips_through_the_panel(self):
+        from PySide6.QtWidgets import QApplication
+
+        from corecycler.gui.tuner_tab import TunerTab
+
+        assert QApplication.instance() or QApplication([])
+        tab = TunerTab(db=None, topology=None, smu=None)
+        assert tab._get_config().max_thermal_retries == TunerConfig().max_thermal_retries
+        tab._apply_config_to_ui(TunerConfig(max_thermal_retries=10))
+        assert tab._get_config().max_thermal_retries == 10

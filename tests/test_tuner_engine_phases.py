@@ -657,12 +657,13 @@ class TestVerdictRouter:
         assert engine._validation_thermal_aborts == 1
         assert engine._hunting is True
 
-    def test_repeated_thermal_stops_end_the_hunt_honestly(self, engine):
+    def test_repeated_thermal_stops_pause_the_hunt(self, engine):
         engine._hunting = True
         engine._validation_thermal_aborts = engine._config.max_thermal_retries
         engine._on_test_finished(0, False, "too hot", "thermal", 1.0, 0.0)
-        assert engine.status == "idle"
-        assert engine._abort_requested
+        assert engine.status == "paused"
+        assert not engine._abort_requested
+        assert engine._hunting is False
 
     def test_a_pass_with_excess_clock_stretch_is_recorded_as_a_failure(self, engine, monkeypatch):
         engine._config.stretch_threshold_pct = 3.0

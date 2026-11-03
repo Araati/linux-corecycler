@@ -2590,9 +2590,9 @@ class TestThermalAbort:
             eng._handle_thermal_abort(0, cs, duration=30.0)
         assert cs.cumulative_test_time == pytest.approx(30.0)
 
-    def test_aborts_after_retry_cap(self, db, simple_topology, mock_smu, mock_backend):
+    def test_pauses_after_retry_cap(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, max_thermal_retries=3)
-        cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-10, thermal_aborts=3)
+        cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-10, best_offset=-5, thermal_aborts=3)
         eng._core_states = {0: cs}
         with (
             patch("corecycler.tuner.engine.QTimer") as qtimer,
@@ -2602,8 +2602,10 @@ class TestThermalAbort:
         ):
             eng._handle_thermal_abort(0, cs, duration=1.0)
         assert cs.thermal_aborts == 4
-        abort_.assert_called_once()
-        qtimer.singleShot.assert_not_called()  # no retry scheduled once aborting
+        abort_.assert_not_called()
+        assert eng.status == "paused"
+        qtimer.singleShot.assert_not_called()  # no retry scheduled once paused
+        assert (cs.phase, cs.current_offset, cs.best_offset) == (TunerPhase.COARSE_SEARCH, -10, -5)
 
     def test_thermal_aborts_reset_on_non_thermal_result(self, db, simple_topology, mock_smu, mock_backend):
         # A non-thermal outcome breaks the streak, so transient thermals at
@@ -2774,17 +2776,20 @@ class TestValidationThermal:
         assert delay_ms == 4000
         assert callback == eng._run_validation_next
 
-    def test_validation_thermal_aborts_after_cap(self, db, simple_topology, mock_smu, mock_backend):
+    def test_validation_thermal_pauses_after_cap(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, max_thermal_retries=3)
         eng._validation_stage = 2
         eng._validation_thermal_aborts = 3
         with (
             patch("corecycler.tuner.engine.QTimer") as qtimer,
             patch.object(eng, "abort") as abort_,
+            patch.object(eng, "_revert_all_to_baseline") as revert_all,
         ):
             eng._handle_validation_thermal_abort(0)
         assert eng._validation_thermal_aborts == 4
-        abort_.assert_called_once()
+        abort_.assert_not_called()
+        revert_all.assert_called_once()  # no aggressive offset left applied while paused
+        assert eng.status == "paused"
         qtimer.singleShot.assert_not_called()
 
 
@@ -2848,3 +2853,37 @@ class TestMaxTemperatureOverride:
         with patch.object(eng, "_run_next"):
             eng.resume(sid)
         assert eng._config.max_temperature_c == 90.0
+
+
+class TestThermalPauseNotAbort:
+    """Hitting the thermal retry cap pauses a resumable session, never aborts
+    it, and never records the offset as failed."""
+
+    def test_thermal_cap_pauses_session_and_resume_continues(self, db, simple_topology, mock_smu, mock_backend):
+        cfg = TunerConfig(cores_to_test=[0], coarse_step=5, fine_step=1, max_offset=-30, max_thermal_retries=1)
+        eng = TunerEngine(db=db, topology=simple_topology, smu=mock_smu, backend=mock_backend, config=cfg)
+        sid = tp.create_session(db, cfg, "", "")
+        eng._session_id = sid
+        cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-20, best_offset=-15)
+        eng._core_states = {0: cs}
+        tp.save_core_state(db, sid, cs)
+
+        with patch("corecycler.tuner.engine.QTimer"):
+            eng._on_test_finished(0, False, "CPU temperature exceeded 95 C", "thermal", 5.0, 0.0)
+            eng._on_test_finished(0, False, "CPU temperature exceeded 95 C", "thermal", 5.0, 0.0)
+
+        assert eng.status == "paused"
+        assert not eng._abort_requested
+        assert tp.get_session(db, sid).status == "paused"
+        saved = tp.load_core_states(db, sid)[0]
+        assert (saved.phase, saved.current_offset, saved.best_offset) == (TunerPhase.COARSE_SEARCH, -20, -15)
+        assert saved.thermal_aborts == 2
+        failed = db._execute_raw("SELECT COUNT(*) AS n FROM tuner_test_log WHERE session_id=? AND passed=0", (sid,))
+        assert failed.fetchone()["n"] == 0  # a thermal stop is never a failed offset
+
+        with patch.object(eng, "_run_next") as run_next:
+            eng.resume(sid)
+        run_next.assert_called_once()
+        assert eng.status == "running"
+        assert eng._core_states[0].thermal_aborts == 0  # streak starts fresh after Resume
+        assert eng._core_states[0].current_offset == -20

@@ -293,6 +293,16 @@ class TunerTab(QWidget):
         self._max_retries_spin.setToolTip("How many times to retry confirmation before backing off")
         search_layout.addRow("Confirm retries:", self._max_retries_spin)
 
+        self._thermal_retries_spin = QSpinBox()
+        self._thermal_retries_spin.setRange(0, 50)
+        self._thermal_retries_spin.setValue(TunerConfig().max_thermal_retries)
+        self._thermal_retries_spin.setToolTip(
+            "How many times a test stopped by the max-temperature limit is retried at the\n"
+            "same offset (after a cooldown) before the tuner pauses. A thermal stop is never\n"
+            "recorded as a failed offset. Resume continues from where it paused."
+        )
+        search_layout.addRow("Thermal retries:", self._thermal_retries_spin)
+
         self._stretch_threshold_spin = QDoubleSpinBox()
         self._stretch_threshold_spin.setRange(0.0, 20.0)
         self._stretch_threshold_spin.setSingleStep(0.5)
@@ -437,6 +447,7 @@ class TunerTab(QWidget):
             confirm_duration_seconds=self._confirm_dur_spin.value(),
             validate_duration_seconds=self._validate_dur_spin.value(),
             max_confirm_retries=self._max_retries_spin.value(),
+            max_thermal_retries=self._thermal_retries_spin.value(),
             stretch_threshold_pct=self._stretch_threshold_spin.value(),
             inherit_current=self._inherit_current_check.isChecked(),
             auto_validate=self._auto_validate_check.isChecked(),
@@ -467,6 +478,7 @@ class TunerTab(QWidget):
         self._search_dur_spin.setValue(cfg.search_duration_seconds)
         self._confirm_dur_spin.setValue(cfg.confirm_duration_seconds)
         self._max_retries_spin.setValue(cfg.max_confirm_retries)
+        self._thermal_retries_spin.setValue(cfg.max_thermal_retries)
         self._stretch_threshold_spin.setValue(cfg.stretch_threshold_pct)
         self._validate_dur_spin.setValue(cfg.validate_duration_seconds)
         self._inherit_current_check.setChecked(cfg.inherit_current)
