@@ -454,3 +454,160 @@ class TestMalformedDmesgTimestamp:
         det = _fresh_detector(baseline=100.0)
         with patch("subprocess.run", return_value=_dmesg_result("no timestamp at all\n")):
             assert det.check_mce() == []
+
+
+class TestKernelStallLines:
+    def test_soft_lockup_names_its_cpu(self):
+        from corecycler.engine.detector import classify_mce_line
+
+        e = classify_mce_line("watchdog: BUG: soft lockup - CPU#3 stuck for 22s! [mprime:1234]")
+        assert e is not None and e.kind == "kernel_stall" and e.cpu == 3
+
+    def test_rcu_stall_takes_cpus_from_the_following_lines_not_the_detector(self):
+        from corecycler.engine.detector import events_from_lines
+
+        events = events_from_lines(
+            [
+                (10.0, "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:"),
+                (10.0, "rcu: \t3-....: (20999 ticks this GP) idle=1234/1/0x4000000000000000"),
+                (10.0, "rcu: \t(detected by 5, t=21002 jiffies, g=12345, q=678)"),
+            ]
+        )
+        assert [(e.kind, e.cpu) for e in events] == [("kernel_stall", 3)]
+
+    def test_rcu_stall_inline_cpu_list_and_rcu_sched(self):
+        from corecycler.engine.detector import events_from_lines
+
+        events = events_from_lines(
+            [(1.0, "INFO: rcu_sched detected stalls on CPUs/tasks: { 2-...! 6-... } (detected by 0)")]
+        )
+        assert sorted(e.cpu for e in events) == [2, 6]
+
+    def test_rcu_header_alone_is_one_unattributed_stall(self):
+        from corecycler.engine.detector import events_from_lines
+
+        events = events_from_lines([(1.0, "rcu: INFO: rcu_preempt self-detected stall on CPU")])
+        assert [(e.kind, e.cpu) for e in events] == [("kernel_stall", -1)]
+
+    def test_kmsg_record_parsing_unescapes_and_drops_metadata(self):
+        from corecycler.engine.detector import parse_kmsg_record
+
+        rec = b"4,1234,5678901234,-;rcu: \\x093-....: (20999 ticks this GP)\n SUBSYSTEM=cpu\n"
+        assert parse_kmsg_record(rec) == (5678.901234, "rcu: \t3-....: (20999 ticks this GP)")
+        assert parse_kmsg_record(b"garbage") is None
+
+
+class TestKmsgReader:
+    def _detector(self, monkeypatch, tmp_path, records):
+        from corecycler.engine import detector as det
+
+        dev = tmp_path / "kmsg"
+        dev.write_bytes(b"6,1,1000,-;old boot line: watchdog: BUG: soft lockup - CPU#0 stuck\n")
+        monkeypatch.setattr(det, "KMSG_PATH", str(dev))
+        d = det.ErrorDetector()
+        d.reset()
+        assert d._kmsg_fd is not None
+        # positioned past what was already in the buffer
+        assert det.os.lseek(d._kmsg_fd, 0, det.os.SEEK_CUR) == dev.stat().st_size
+        queue = list(records)
+
+        def fake_read(fd, n):
+            if not queue:
+                raise BlockingIOError
+            item = queue.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        monkeypatch.setattr(det.os, "read", fake_read)
+        monkeypatch.setattr(det.subprocess, "run", lambda *a, **k: pytest.fail("dmesg must not be polled"))
+        return d
+
+    def test_new_records_are_seen_on_the_next_check_without_rate_limit(self, monkeypatch, tmp_path):
+        d = self._detector(
+            monkeypatch,
+            tmp_path,
+            [
+                b"4,10,2000000,-;rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:\n",
+                BrokenPipeError(),  # overwritten records are skipped, reading continues
+                b"4,11,2000001,-;rcu: \\x094-....: (5250 ticks this GP)\n",
+            ],
+        )
+        events = d.check_mce()
+        assert [(e.kind, e.cpu) for e in events] == [("kernel_stall", 4)]
+        assert d.check_mce() == []  # each event once
+        d.close()
+        assert d._kmsg_fd is None
+
+    def test_unreadable_kmsg_falls_back_to_dmesg(self, monkeypatch):
+        from corecycler.engine import detector as det
+
+        calls = []
+        monkeypatch.setattr(det, "_get_dmesg_raw_timestamp", lambda: (calls.append(1), 1.0)[1])
+        d = det.ErrorDetector()
+        d.reset()
+        assert d._kmsg_fd is None and calls == [1]
+
+
+class TestHarvestKeepsOldForensics:
+    def test_stall_lines_do_not_change_post_crash_attribution(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from corecycler.engine import detector as det
+
+        out = (
+            "1700000000.1 host kernel: watchdog: BUG: soft lockup - CPU#3 stuck for 22s!\n"
+            "1700000000.2 host kernel: rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:\n"
+            "1700000000.3 host kernel: rcu: \t3-....: (20999 ticks this GP)\n"
+        )
+        monkeypatch.setattr(det.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=out, stderr=""))
+        events, ok = det.harvest_kernel_mce("2026-11-03T12:00:00+00:00")
+        assert ok
+        assert [(e.kind, e.cpu) for e in events] == [("mce", -1)]
+
+
+class TestStallReportStackDump:
+    """A real stall report carries the stalled CPU's stack dump; those lines
+    match the kernel-error rule but belong to the stall."""
+
+    def _records(self, *bodies, start_usec=2_000_000):
+        return [f"4,{20 + i},{start_usec + i},-;{b}\n".encode() for i, b in enumerate(bodies)]
+
+    def test_rip_and_call_trace_after_a_stall_are_dropped(self, monkeypatch, tmp_path):
+        d = TestKmsgReader()._detector(
+            monkeypatch,
+            tmp_path,
+            self._records(
+                "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:",
+                "rcu: \\x095-....: (21000 ticks this GP)",
+                "RIP: 0010:foo+0x1/0x2",
+                "Call Trace:",
+            ),
+        )
+        assert [(e.kind, e.cpu) for e in d.check_mce()] == [("kernel_stall", 5)]
+
+    def test_trace_split_into_the_next_poll_is_still_dropped(self, monkeypatch, tmp_path):
+        records = self._records(
+            "watchdog: BUG: soft lockup - CPU#5 stuck for 22s! [mprime:99]",
+            "RIP: 0010:foo+0x1/0x2",
+            "Call Trace:",
+        )
+        d = TestKmsgReader()._detector(monkeypatch, tmp_path, [records[0], BlockingIOError(), *records[1:]])
+        assert [(e.kind, e.cpu) for e in d.check_mce()] == [("kernel_stall", 5)]
+        assert d.check_mce() == []
+
+    def test_kernel_error_without_a_stall_is_still_reported(self, monkeypatch, tmp_path):
+        d = TestKmsgReader()._detector(monkeypatch, tmp_path, self._records("general protection fault: 0000 [#1]"))
+        assert [(e.kind, e.cpu) for e in d.check_mce()] == [("kernel_error", -1)]
+
+    def test_kernel_error_long_after_a_stall_is_reported(self, monkeypatch, tmp_path):
+        stall = self._records("watchdog: BUG: soft lockup - CPU#5 stuck for 22s!")
+        late = self._records("general protection fault: 0000 [#1]", start_usec=60_000_000)
+        d = TestKmsgReader()._detector(monkeypatch, tmp_path, stall + late)
+        assert [(e.kind, e.cpu) for e in d.check_mce()] == [("kernel_stall", 5), ("kernel_error", -1)]
+
+    def test_expedited_rcu_stall_is_a_stall(self):
+        from corecycler.engine.detector import classify_mce_line
+
+        e = classify_mce_line("rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks: { 3-... }")
+        assert e is not None and e.kind == "kernel_stall"

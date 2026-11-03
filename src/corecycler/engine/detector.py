@@ -1,6 +1,9 @@
-"""Error detection — MCE (Machine Check Exceptions) and kernel crash lines.
+"""Error detection — MCE (Machine Check Exceptions), kernel crash lines and
+kernel stall warnings (RCU stalls, soft lockups).
 
-The kernel log is the single source of truth. The legacy sysfs
+The kernel log is the single source of truth. During a test it is read from
+/dev/kmsg (non-blocking, positioned at the end of the buffer when the test
+starts), falling back to polling ``dmesg`` when /dev/kmsg cannot be opened. The legacy sysfs
 /sys/devices/system/machinecheck/*/bank* files are MCA control registers
 (constant enable masks), not error counters — they never change when an
 error is logged, so counting them cannot detect anything.
@@ -10,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import re
 import subprocess
 import time
@@ -20,6 +24,11 @@ from corecycler.config import tools
 
 log = logging.getLogger(__name__)
 
+# Kernel log device. Module-level so tests can point it elsewhere.
+KMSG_PATH = "/dev/kmsg"
+# Upper bound on records drained per check, so a log flood cannot pin a poll.
+_KMSG_MAX_RECORDS = 10000
+
 
 @dataclass(slots=True)
 class MCEEvent:
@@ -29,6 +38,10 @@ class MCEEvent:
     message: str
     corrected: bool
     raw_ts: float = 0.0  # kernel/journal timestamp of the source line
+    # "mce" (machine check), "kernel_error" (oops/BUG/stack dump line) or
+    # "kernel_stall" (RCU stall, soft lockup). For a stall, cpu is the stalled
+    # logical CPU, or -1 when none was named.
+    kind: str = "mce"
 
 
 @dataclass(slots=True)
@@ -52,12 +65,93 @@ _CPU_RE = re.compile(r"\bcpu[:\s]+(\d+)", re.IGNORECASE)
 _BANK_RE = re.compile(r"\bbank[:\s]+(\d+)", re.IGNORECASE)
 
 
+# "watchdog: BUG: soft lockup - CPU#3 stuck for 22s! [mprime:1234]"
+_SOFT_LOCKUP_RE = re.compile(r"\bsoft lockup\b.*?\bcpu#(\d+)", re.IGNORECASE)
+# "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:" and
+# "rcu: INFO: rcu_sched self-detected stall on CPU" (rcu_sched on non-preempt kernels)
+_RCU_STALL_RE = re.compile(r"\brcu_\w+ (?:self-)?detected (?:expedited )?stalls?\b", re.IGNORECASE)
+# Per-CPU line that follows an RCU stall header: "rcu: \t3-....: (20999 ticks this GP) ..."
+# The "(detected by N, ...)" line names the CPU that NOTICED the stall and never matches.
+_RCU_STALL_CPU_RE = re.compile(r"^(?:rcu:)?\s+(\d+)-\S*:")
+# Older kernels list the CPUs inline: "... detected stalls on CPUs/tasks: { 3-...! 5-... }"
+_RCU_INLINE_CPUS_RE = re.compile(r"\{([^}]*)\}")
+
+
+def _stall_event(body: str) -> MCEEvent | None:
+    """A kernel stall warning, or None. RCU headers carry no CPU (cpu=-1);
+    the caller attaches the CPUs from the per-CPU lines that follow."""
+    m = _SOFT_LOCKUP_RE.search(body)
+    if m:
+        cpu = int(m.group(1))
+    elif _RCU_STALL_RE.search(body):
+        cpu = -1
+    else:
+        return None
+    return MCEEvent(
+        timestamp=time.time(),
+        cpu=cpu,
+        bank=-1,
+        message=body.strip(),
+        corrected=False,
+        kind="kernel_stall",
+    )
+
+
+def events_from_lines(lines: list[tuple[float, str]]) -> list[MCEEvent]:
+    """Classify (raw_ts, body) kernel lines in order into events.
+
+    An RCU stall header is followed by one line per stalled CPU; each named
+    CPU becomes its own event. A header with no CPU lines in this batch stays
+    a single cpu=-1 event.
+    """
+    events: list[MCEEvent] = []
+    i = 0
+    while i < len(lines):
+        raw_ts, body = lines[i]
+        i += 1
+        event = classify_mce_line(body)
+        if event is None:
+            continue
+        event.raw_ts = raw_ts
+        if event.kind == "kernel_stall" and event.cpu == -1:
+            inline = _RCU_INLINE_CPUS_RE.search(body)
+            cpus = [int(n) for n in re.findall(r"(\d+)-", inline.group(1))] if inline else []
+            while i < len(lines):
+                m = _RCU_STALL_CPU_RE.match(lines[i][1])
+                if not m:
+                    break
+                cpus.append(int(m.group(1)))
+                i += 1
+            for cpu in dict.fromkeys(cpus):
+                events.append(
+                    MCEEvent(
+                        timestamp=event.timestamp,
+                        cpu=cpu,
+                        bank=-1,
+                        message=event.message,
+                        corrected=False,
+                        raw_ts=raw_ts,
+                        kind="kernel_stall",
+                    )
+                )
+            if cpus:
+                continue
+        events.append(event)
+    return events
+
+
 def classify_mce_line(body: str) -> MCEEvent | None:
     """Classify one kernel message body (no timestamp prefix) into an event.
 
     Returns None for non-error lines, informational MCE lines, and the
     continuation lines of an AMD decoded block.
     """
+    # Stalls first: "watchdog: BUG: soft lockup" would otherwise match the
+    # generic "bug:" kernel-error rule and lose its CPU.
+    stall = _stall_event(body)
+    if stall is not None:
+        return stall
+
     lower = body.lower()
 
     m = _AMD_STATUS_RE.search(lower)
@@ -91,6 +185,7 @@ def classify_mce_line(body: str) -> MCEEvent | None:
             bank=-1,
             message=body.strip(),
             corrected=False,
+            kind="kernel_error",
         )
 
     return None
@@ -105,27 +200,65 @@ class ErrorDetector:
     re-processing duplicates on each poll.
     """
 
-    # Minimum interval between dmesg subprocess calls (seconds).
+    # Minimum interval between dmesg subprocess calls (seconds). The
+    # /dev/kmsg path has no rate limit: a read is a cheap non-blocking syscall.
     DMESG_MIN_INTERVAL: float = 5.0
+    # A stall report is followed by the stalled CPU's stack dump ("RIP: ...",
+    # "Call Trace:"), which matches the kernel-error rule. Kernel-error lines
+    # logged within this many seconds (kernel timestamps) after a stall belong
+    # to that report and are dropped, even when they arrive in a later poll.
+    STALL_TRACE_WINDOW: float = 10.0
 
     def __init__(self) -> None:
         self._dmesg_baseline_ts: float = 0.0  # raw monotonic timestamp
         self._last_dmesg_time: float = 0.0
         self._seen: set[tuple[float, int, int]] = set()
+        self._kmsg_fd: int | None = None
+        self._last_stall_ts: float | None = None
 
     def reset(self) -> None:
         """Start a new observation window — only lines newer than now count."""
-        self._dmesg_baseline_ts = _get_dmesg_raw_timestamp()
-        self._last_dmesg_time = 0.0
+        self.close()
         self._seen.clear()
+        self._last_stall_ts = None
+        self._last_dmesg_time = 0.0
+        self._kmsg_fd = _open_kmsg_at_end(KMSG_PATH)
+        if self._kmsg_fd is None:
+            self._dmesg_baseline_ts = _get_dmesg_raw_timestamp()
+
+    def close(self) -> None:
+        """Release the /dev/kmsg descriptor (reset() reopens it)."""
+        if self._kmsg_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._kmsg_fd)
+            self._kmsg_fd = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def check_mce(self) -> list[MCEEvent]:
-        """Return new MCE/kernel-error events since reset(), each exactly once.
+        """Return new MCE/kernel-error/kernel-stall events since reset(), each
+        exactly once.
 
-        Rate-limited: within DMESG_MIN_INTERVAL of the previous subprocess
-        call it returns [] instead of re-running dmesg; the event is delivered
-        on the first poll after the interval elapses.
+        From /dev/kmsg: every record logged since reset(), on every call.
+        From the dmesg fallback: rate-limited — within DMESG_MIN_INTERVAL of
+        the previous subprocess call it returns [] instead of re-running
+        dmesg; the event is delivered on the first poll after the interval.
         """
+        events = self._accept(events_from_lines(self._read_lines()))
+        if self._kmsg_fd is None and events:
+            log.debug(
+                "dmesg poll: %d new event(s)%s",
+                len(events),
+                "".join(f" [cpu={e.cpu} bank={e.bank} ce={e.corrected}]" for e in events),
+            )
+        return events
+
+    def _read_lines(self) -> list[tuple[float, str]]:
+        """New (raw_ts, body) kernel lines since the last call."""
+        if self._kmsg_fd is not None:
+            return _drain_kmsg(self._kmsg_fd)
+
         now = time.monotonic()
         if now - self._last_dmesg_time < self.DMESG_MIN_INTERVAL:
             return []
@@ -136,7 +269,7 @@ class ErrorDetector:
         if self._dmesg_baseline_ts <= 0:
             return []
 
-        events: list[MCEEvent] = []
+        lines: list[tuple[float, str]] = []
         try:
             # No --level filter: AMD decoded corrected-error lines are logged
             # below err/warn and a level filter silently hides them; the line
@@ -159,24 +292,90 @@ class ErrorDetector:
                     continue
                 if raw_ts <= self._dmesg_baseline_ts:
                     continue
-                event = classify_mce_line(line[ts_match.end() :])
-                if event is None:
-                    continue
-                event.raw_ts = raw_ts
-                key = (raw_ts, event.cpu, event.bank)
-                if key in self._seen:
-                    continue
-                self._seen.add(key)
-                events.append(event)
+                lines.append((raw_ts, line[ts_match.end() :]))
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError, PermissionError) as exc:
             log.debug("dmesg check failed: %s", exc)
-            return events
-        log.debug(
-            "dmesg poll: %d new event(s)%s",
-            len(events),
-            "".join(f" [cpu={e.cpu} bank={e.bank} ce={e.corrected}]" for e in events),
-        )
-        return events
+        return lines
+
+    def _accept(self, events: list[MCEEvent]) -> list[MCEEvent]:
+        """Drop events already returned and the stack-dump lines of a stall report."""
+        fresh: list[MCEEvent] = []
+        for event in events:
+            key = (event.raw_ts, event.cpu, event.bank)
+            if key in self._seen:
+                continue
+            self._seen.add(key)
+            if event.kind == "kernel_stall":
+                self._last_stall_ts = max(self._last_stall_ts or event.raw_ts, event.raw_ts)
+            elif (
+                event.kind == "kernel_error"
+                and self._last_stall_ts is not None
+                and 0 <= event.raw_ts - self._last_stall_ts <= self.STALL_TRACE_WINDOW
+            ):
+                log.debug("dropped stall stack-dump line: %s", event.message)
+                continue
+            fresh.append(event)
+        return fresh
+
+
+def _open_kmsg_at_end(path: str) -> int | None:
+    """Open the kernel log device positioned AFTER every record already in
+    the buffer, so only messages logged from now on are read."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        log.debug("%s unavailable (%s) — falling back to dmesg polling", path, exc)
+        return None
+    try:
+        os.lseek(fd, 0, os.SEEK_END)
+    except OSError as exc:
+        log.debug("cannot seek %s (%s) — falling back to dmesg polling", path, exc)
+        os.close(fd)
+        return None
+    return fd
+
+
+_KMSG_ESCAPE_RE = re.compile(r"\\x([0-9a-fA-F]{2})")
+
+
+def parse_kmsg_record(record: bytes) -> tuple[float, str] | None:
+    """Parse one /dev/kmsg record "prio,seq,ts_usec,flags;text\n KEY=VAL..."
+    into (seconds since boot, text). Continuation lines (device metadata)
+    are dropped; the kernel's \\xNN escapes (a tab arrives as \\x09) are undone."""
+    text = record.decode("utf-8", errors="replace")
+    header, sep, rest = text.partition(";")
+    if not sep:
+        return None
+    fields = header.split(",")
+    if len(fields) < 3:
+        return None
+    try:
+        ts = int(fields[2]) / 1_000_000
+    except ValueError:
+        return None
+    message = rest.split("\n", 1)[0]
+    return ts, _KMSG_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), message)
+
+
+def _drain_kmsg(fd: int) -> list[tuple[float, str]]:
+    """Read every record available on a non-blocking /dev/kmsg descriptor."""
+    lines: list[tuple[float, str]] = []
+    for _ in range(_KMSG_MAX_RECORDS):
+        try:
+            record = os.read(fd, 8192)
+        except BlockingIOError:
+            break  # drained
+        except BrokenPipeError:
+            continue  # records were overwritten before we read them; resume with the next
+        except OSError as exc:
+            log.debug("/dev/kmsg read failed: %s", exc)
+            break
+        if not record:
+            break
+        parsed = parse_kmsg_record(record)
+        if parsed is not None:
+            lines.append(parsed)
+    return lines
 
 
 def harvest_kernel_mce(since_utc_iso: str, timeout: float = 15.0) -> tuple[list[MCEEvent], bool]:
@@ -230,6 +429,14 @@ def harvest_kernel_mce(since_utc_iso: str, timeout: float = 15.0) -> tuple[list[
         event = classify_mce_line(m.group(2))
         if event is None:
             continue
+        if event.kind == "kernel_stall":
+            # Post-crash forensics keep their old behaviour: a soft lockup is
+            # an unattributed kernel error (it matched "bug:" before stall
+            # detection existed); an RCU stall line was never an event.
+            if not _SOFT_LOCKUP_RE.search(event.message):
+                continue
+            event.kind = "mce"
+            event.cpu = -1
         try:
             event.raw_ts = float(m.group(1))
         except ValueError:

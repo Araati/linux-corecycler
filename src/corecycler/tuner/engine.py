@@ -134,7 +134,9 @@ def _serialize_mce(events: list[MCEEvent]) -> str:
     return json.dumps(
         [
             {
-                "cpu": e.cpu,
+                # A stall names a stalled CPU, not a faulting core: keep it out
+                # of per-core evidence (it is reported as unattributed).
+                "cpu": -1 if e.kind == "kernel_stall" else e.cpu,
                 "bank": e.bank,
                 "corrected": e.corrected,
                 "message": e.message,
@@ -2496,6 +2498,14 @@ class TunerEngine(QObject):
             return
 
         cs.in_test = False
+        kernel_stall = not passed and error_type == "kernel_stall"
+        if kernel_stall:
+            log.warning("Kernel stall on core %d at CO %d: %s", core_id, cs.current_offset, error_msg)
+            self.log_message.emit(
+                f"KERNEL STALL on core {core_id} at offset {cs.current_offset} — stress "
+                f"stopped, counted as a FAILURE of this offset; reverting the core to "
+                f"baseline and backing off. ({error_msg})"
+            )
         # A validation worker marks its whole stressed set in_test; the box
         # survived this result, so clear and persist all of them (not just the
         # reported core) before advancing.
@@ -2543,7 +2553,13 @@ class TunerEngine(QObject):
                     "test — resident offsets stay unproven for this run."
                 )
             else:
-                tp.journal_mark_survived(self._db, self._session_id, exclude_cores=sorted(foreign))
+                # A kernel stall on the tested core is the opposite of proof
+                # that its offset is survivable: if the box freezes moments
+                # later, crash attribution must still see that value unproven.
+                unproven = set(foreign)
+                if kernel_stall:
+                    unproven.add(core_id)
+                tp.journal_mark_survived(self._db, self._session_id, exclude_cores=sorted(unproven))
                 for c, v in tp.journal_survived_values(self._db, self._session_id).items():
                     if self._is_more_aggressive(v, self._co_survived.get(c, 0)):
                         self._co_survived[c] = v
@@ -2641,6 +2657,9 @@ class TunerEngine(QObject):
                 fft_preset=fft_preset,
                 peak_stretch_pct=peak_stretch_pct if peak_stretch_pct > 0 else None,
             )
+            if kernel_stall:
+                # The failure row must survive a freeze that may follow the stall.
+                tp.checkpoint(self._db)
 
         if results_json and self._session_id and self._validation_stage in (2, 3, 6):
             self._log_parallel_rows(core_id, results_json, log_phase)
@@ -2742,6 +2761,8 @@ class TunerEngine(QObject):
         # Multi-core validation uses its own flow — don't advance per-core state machine
         if self._validation_stage > 0:
             self._on_validation_test_finished(core_id, passed)
+            if kernel_stall:
+                tp.checkpoint(self._db)
             return
 
         cs = self._core_states[core_id]
@@ -2753,6 +2774,8 @@ class TunerEngine(QObject):
 
         # Advance state machine
         self._advance_core(core_id, passed)
+        if kernel_stall:
+            tp.checkpoint(self._db)  # the back-off, durable before the next test
 
         # Continue with the next test on a fresh event-loop stack (matches the
         # validation path) so a synchronous start failure cannot recurse back

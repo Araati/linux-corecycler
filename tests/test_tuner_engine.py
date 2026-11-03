@@ -2887,3 +2887,34 @@ class TestThermalPauseNotAbort:
         assert eng.status == "running"
         assert eng._core_states[0].thermal_aborts == 0  # streak starts fresh after Resume
         assert eng._core_states[0].current_offset == -20
+
+
+class TestKernelStallIsAFailure:
+    """A kernel stall fails the offset under test: logged durably at once,
+    the offset stays unproven, and the normal back-off runs."""
+
+    def test_kernel_stall_logs_a_durable_failure_and_backs_off(self, db, simple_topology, mock_smu, mock_backend):
+        cfg = TunerConfig(cores_to_test=[0], coarse_step=5, fine_step=1, max_offset=-30)
+        eng = TunerEngine(db=db, topology=simple_topology, smu=mock_smu, backend=mock_backend, config=cfg)
+        sid = tp.create_session(db, cfg, "", "")
+        eng._session_id = sid
+        cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-20, best_offset=-15, in_test=True)
+        eng._core_states = {0: cs}
+        tp.save_core_state(db, sid, cs)
+        msg = "Kernel stall during stress: watchdog: BUG: soft lockup - CPU#0 stuck for 22s!"
+
+        with (
+            patch("corecycler.tuner.engine.QTimer"),
+            patch.object(tp, "checkpoint", wraps=tp.checkpoint) as ckpt,
+            patch.object(tp, "journal_mark_survived") as survived,
+            patch.object(eng, "_advance_core", wraps=eng._advance_core) as advance,
+        ):
+            eng._on_test_finished(0, False, msg, "kernel_stall", 12.0, 0.0)
+
+        rows = db._execute_raw(
+            "SELECT offset_tested, passed, error_type FROM tuner_test_log WHERE session_id=?", (sid,)
+        ).fetchall()
+        assert [(r["offset_tested"], r["passed"], r["error_type"]) for r in rows] == [(-20, 0, "kernel_stall")]
+        assert ckpt.call_count >= 2  # failure row, then the back-off
+        assert 0 in survived.call_args.kwargs["exclude_cores"]  # stalled value stays unproven
+        advance.assert_called_once_with(0, False)

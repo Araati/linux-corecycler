@@ -339,9 +339,14 @@ class Supervisor:
         events = self.detector.check_mce()
         if not events:
             return False
+        stalls = [e for e in events if e.kind == "kernel_stall"]
+        events = [e for e in events if e.kind != "kernel_stall"]
+        hit = self._apply_kernel_stalls(runs, stalls, start, eligible=lambda r: r.verdict is None)
+        # Stall lines stay out of the observed MCE evidence: an RCU stall can
+        # name a CPU that was only waiting, and observed events demote the
+        # cores they name.
         self.observed.extend(events)
         cpu_to_run = {cpu: run for run in runs for cpu in run.lane.cpus}
-        hit = False
         for event in events:
             if event.cpu == -1:
                 anchor = min((r for r in runs if r.verdict is None), default=None, key=lambda r: r.lane.core_id)
@@ -361,6 +366,57 @@ class Supervisor:
                 self._fail(run, f"MCE during {self.phase}: {event.message}", start, error_type="mce")
                 hit = True
         return hit
+
+    def _apply_kernel_stalls(
+        self,
+        runs: list[_LaneRun],
+        stalls: list[MCEEvent],
+        start: float,
+        *,
+        eligible: Callable[[_LaneRun], bool],
+    ) -> bool:
+        """Fail the lane under test on an RCU stall / soft lockup and stop the run.
+
+        One lane (the per-core search): that lane fails whatever CPU the
+        kernel named — it is the only core away from baseline. Several lanes
+        (validation): a named CPU inside a lane fails that lane; a stall that
+        names no lane's CPU is recorded as unattributed (retried without a
+        verdict), never pinned on a guessed core.
+        """
+        if not stalls:
+            return False
+        live = [r for r in runs if eligible(r)]
+        if not live:
+            return False
+        cpu_to_run = {cpu: r for r in live for cpu in r.lane.cpus}
+        targets: dict[int, tuple[_LaneRun, MCEEvent]] = {}
+        for event in stalls:
+            run = cpu_to_run.get(event.cpu)
+            if run is None and len(runs) == 1:
+                run = live[0]
+            if run is not None:
+                targets.setdefault(run.lane.core_id, (run, event))
+        for run, event in targets.values():
+            run.verdict = StressResult(
+                core_id=run.lane.core_id,
+                passed=False,
+                duration_seconds=time.monotonic() - start,
+                error_message=f"Kernel stall during {self.phase}: {event.message}",
+                error_type="kernel_stall",
+            )
+        if not targets:
+            anchor = min(live, key=lambda r: r.lane.core_id)
+            anchor.verdict = StressResult(
+                core_id=anchor.lane.core_id,
+                passed=False,
+                duration_seconds=time.monotonic() - start,
+                error_message=f"Kernel stall without core attribution during {self.phase}: {stalls[0].message}",
+                error_type="mce_unattributed",
+            )
+        # Always stop now, whatever stop_on_first_failure says: the stress
+        # process must be killed before the stall turns into a freeze.
+        self.stop_event.set()
+        return True
 
     def _poll_backend_errors(self, runs: list[_LaneRun], start: float) -> bool:
         for run in runs:
@@ -521,6 +577,9 @@ class Supervisor:
             self._drain(run)
             kill_process_group(run.proc)
         drained = self.detector.check_mce()
+        stalls = [e for e in drained if e.kind == "kernel_stall"]
+        drained = [e for e in drained if e.kind != "kernel_stall"]
+        self._apply_kernel_stalls(runs, stalls, start, eligible=lambda r: r.verdict is None or r.verdict.passed)
         if drained:
             self.observed.extend(drained)
             cpu_to_run = {cpu: r for r in runs for cpu in r.lane.cpus}
@@ -610,6 +669,10 @@ def watch_idle(
             return f"CPU temperature exceeded {thermal.max_temperature} C safety limit during {phase}"
         events = detector.check_mce()
         if events:
+            for event in events:
+                if event.kind == "kernel_stall":
+                    # Idle phase of the core under test: any stall counts against it.
+                    return f"Kernel stall during {phase}: {event.message}"
             observed.extend(events)
             for event in events:
                 if event.cpu == -1 or event.cpu in own:
@@ -630,8 +693,12 @@ def classify_error(msg: str | None) -> str:
         or "containment fault" in msg_lower
     ):
         return "startup"
-    if "machine check without core attribution" in msg_lower:
+    if "machine check without core attribution" in msg_lower or "kernel stall without core attribution" in msg_lower:
         return "mce_unattributed"
+    # Before the generic "stall" rule: a kernel stall is a stability failure,
+    # the apparatus "stall" (no progress from the stress process) is not.
+    if "kernel stall" in msg_lower:
+        return "kernel_stall"
     if "mce" in msg_lower or "machine check" in msg_lower:
         return "mce"
     if "temperature" in msg_lower or "thermal" in msg_lower:

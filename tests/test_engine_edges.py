@@ -22,13 +22,14 @@ from corecycler.engine.scheduler import CoreScheduler
 
 
 class Event:
-    def __init__(self, cpu: int, message: str = "boom") -> None:
+    def __init__(self, cpu: int, message: str = "boom", kind: str = "mce") -> None:
         self.cpu = cpu
         self.bank = 0
         self.message = message
         self.corrected = False
         self.timestamp = 0.0
         self.raw_ts = 0.0
+        self.kind = kind
 
 
 class TestContainmentProbe:

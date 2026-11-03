@@ -786,3 +786,12 @@ def isolated_config_dir(monkeypatch, tmp_path_factory):
     from corecycler.config import settings as settings_mod
 
     monkeypatch.setattr(settings_mod, "CONFIG_DIR", tmp_path_factory.mktemp("config"))
+
+
+@pytest.fixture(autouse=True)
+def no_host_kmsg(monkeypatch, tmp_path_factory):
+    """Detectors fall back to (mocked) dmesg; host kernel lines never leak in.
+    Tests that exercise the /dev/kmsg reader point KMSG_PATH at a fake."""
+    from corecycler.engine import detector as detector_mod
+
+    monkeypatch.setattr(detector_mod, "KMSG_PATH", str(tmp_path_factory.mktemp("kmsg") / "absent"))

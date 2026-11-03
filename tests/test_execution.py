@@ -17,6 +17,7 @@ from corecycler.config.tools import Resolution
 from corecycler.engine import containment, execution
 from corecycler.engine.backends.base import StressBackend, StressConfig, StressMode
 from corecycler.engine.backends.stressapptest import StressapptestBackend
+from corecycler.engine.detector import ErrorDetector
 from corecycler.engine.execution import (
     Lane,
     SuperviseHooks,
@@ -98,13 +99,14 @@ class FakeDetector:
 
 
 class Event:
-    def __init__(self, cpu: int, message: str = "boom") -> None:
+    def __init__(self, cpu: int, message: str = "boom", kind: str = "mce") -> None:
         self.cpu = cpu
         self.bank = 0
         self.message = message
         self.corrected = False
         self.timestamp = 0.0
         self.raw_ts = 0.0
+        self.kind = kind
 
 
 def cool_thermal() -> ThermalWatch:
@@ -785,3 +787,121 @@ class TestContainment:
 
     def test_an_unreadable_proc_observes_nothing(self, tmp_path):
         assert containment.observed_tree_cpus(4242, proc_base=tmp_path / "gone") == set()
+
+
+class TestKernelStall:
+    """An RCU stall / soft lockup during a test fails the core under test at
+    once and stops the stress process."""
+
+    def test_single_lane_fails_whatever_cpu_the_kernel_names(self, tmp_path):
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        detector = FakeDetector([[Event(cpu=7, message="rcu: INFO: rcu_preempt detected stalls", kind="kernel_stall")]])
+        supervisor, stop, seen = make_supervisor(backend, detector=detector)
+        verdict = run_one(supervisor, lane(tmp_path, cpus=(0, 16)), 60.0)
+        assert verdict is not None and not verdict.passed
+        assert verdict.error_type == "kernel_stall"
+        assert "rcu_preempt" in verdict.error_message
+        assert stop.is_set()  # stress killed now, not at the end of the run
+        assert seen == []  # never per-core MCE evidence
+
+    def test_multi_lane_named_cpu_fails_that_lane(self, tmp_path):
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        detector = FakeDetector([[Event(cpu=5, message="soft lockup - CPU#5 stuck", kind="kernel_stall")]])
+        supervisor, _, _ = make_supervisor(backend, detector=detector)
+        verdicts = supervisor.run([lane(tmp_path, 0, (0,)), lane(tmp_path, 5, (5,))], lambda _l: StressConfig(), 60.0)
+        assert verdicts[5] is not None and verdicts[5].error_type == "kernel_stall"
+        assert verdicts[0] is None
+
+    def test_multi_lane_unnamed_stall_is_not_pinned_on_a_guess(self, tmp_path):
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        detector = FakeDetector([[Event(cpu=-1, message="rcu: INFO: rcu_sched detected stalls", kind="kernel_stall")]])
+        supervisor, _, _ = make_supervisor(backend, detector=detector)
+        verdicts = supervisor.run([lane(tmp_path, 0, (0,)), lane(tmp_path, 5, (5,))], lambda _l: StressConfig(), 60.0)
+        assert verdicts[0] is not None and verdicts[0].error_type == "mce_unattributed"
+
+    def test_classify_error_keeps_kernel_stall_apart_from_apparatus_stall(self):
+        assert execution.classify_error("Kernel stall during idle: rcu: INFO: rcu_preempt detected stalls") == (
+            "kernel_stall"
+        )
+        assert execution.classify_error("stress process stalled") == "stall"
+
+
+class LineDetector(ErrorDetector):
+    """The real event pipeline (classification, dedupe, stall-trace
+    suppression) fed from batches of raw (raw_ts, body) kernel lines."""
+
+    def __init__(self, batches: list[list[tuple[float, str]]]) -> None:
+        super().__init__()
+        self.batches = list(batches)
+
+    def reset(self) -> None:
+        pass
+
+    def _read_lines(self):
+        return self.batches.pop(0) if self.batches else []
+
+
+_RCU_REPORT = [
+    (100.0, "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:"),
+    (100.0, "rcu: \t5-....: (21000 ticks this GP) idle=1234"),
+    (100.1, "rcu: \t(detected by 3, t=21002 jiffies, g=99, q=7)"),
+    (100.1, "Sending NMI from CPU 3 to CPUs 5:"),
+    (100.1, "NMI backtrace for cpu 5"),
+    (100.1, "CPU: 5 PID: 4242 Comm: mprime Not tainted 7.0.0-38-generic"),
+    (100.1, "RIP: 0010:foo+0x1/0x2"),
+    (100.1, "Call Trace:"),
+]
+
+
+class TestRealisticStallReport:
+    """The stall report's stack dump must not turn into an unattributed
+    machine check on another lane or into per-core MCE evidence."""
+
+    def _two_lanes(self, tmp_path, batches):
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        supervisor, _, seen = make_supervisor(backend, detector=LineDetector(batches))
+        verdicts = supervisor.run([lane(tmp_path, 0, (0,)), lane(tmp_path, 5, (5,))], lambda _l: StressConfig(), 60.0)
+        return verdicts, seen
+
+    def test_two_lanes_whole_report_in_one_poll(self, tmp_path):
+        verdicts, seen = self._two_lanes(tmp_path, [_RCU_REPORT])
+        assert verdicts[5] is not None and verdicts[5].error_type == "kernel_stall"
+        assert verdicts[0] is None
+        assert seen == []
+
+    def test_two_lanes_trace_in_the_next_poll(self, tmp_path):
+        verdicts, seen = self._two_lanes(tmp_path, [_RCU_REPORT[:2], _RCU_REPORT[2:]])
+        assert verdicts[5] is not None and verdicts[5].error_type == "kernel_stall"
+        assert verdicts[0] is None
+        assert seen == []
+
+    def test_single_lane_keeps_observed_empty(self, tmp_path):
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        supervisor, _, seen = make_supervisor(backend, detector=LineDetector([_RCU_REPORT]))
+        verdict = run_one(supervisor, lane(tmp_path, 5, (5,)), 60.0)
+        assert verdict is not None and verdict.error_type == "kernel_stall"
+        assert seen == []
+
+    def test_trace_arriving_in_the_end_of_run_drain(self, tmp_path):
+        backend = FakeBackend(_child("import time; time.sleep(0.3)"))
+        # The poll loop sees nothing; the drain at the end sees stall + trace.
+        detector = LineDetector([])
+        supervisor, _, seen = make_supervisor(backend, detector=detector)
+        orig_finish = supervisor._finish
+
+        def finish(runs, start, duration):
+            detector.batches = [_RCU_REPORT]
+            return orig_finish(runs, start, duration)
+
+        supervisor._finish = finish
+        verdicts = supervisor.run([lane(tmp_path, 0, (0,)), lane(tmp_path, 5, (5,))], lambda _l: StressConfig(), 0.2)
+        assert verdicts[5] is not None and verdicts[5].error_type == "kernel_stall"
+        assert verdicts[0] is None or verdicts[0].passed
+        assert seen == []
+
+
+def test_scheduler_wrapped_kernel_stall_message_still_classifies_as_kernel_stall():
+    # scheduler.py drops error_type on its variable-load/idle paths and
+    # re-classifies the message.
+    msg = "Failure during rapid transition cycle 2: Kernel stall during stress: watchdog: BUG: soft lockup - CPU#5"
+    assert classify_error(msg) == "kernel_stall"

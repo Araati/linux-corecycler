@@ -57,6 +57,9 @@ penalty never overshoots past stock (CO=0).
 ## Verdict classes that never enter this state machine
 
 - `thermal` — cool down and retry the same offset (no transition).
+- `kernel_stall` is NOT in this list: an RCU stall or soft lockup during a test
+  is an ordinary FAIL of the offset under test (normal back-off), logged and
+  checkpointed at once, and the stalled value is never marked survived.
 - `startup` — environment fault: revert the offset, persist `in_test=0`,
   pause. Never logged as a verdict, never marks the journal survived.
 - Apparatus-breaker trips (implausible fail streaks, search flow only) —
