@@ -786,3 +786,40 @@ class TestForceStop:
     def test_force_stop_without_an_engine_is_a_noop(self, tab):
         tab.force_stop()
         assert tab._engine is None
+
+
+class TestAbortLeavesResumable:
+    """An aborted session keeps its progress in the DB; Resume must be offered
+    right away, not only after an app restart."""
+
+    def test_abort_button_keeps_resume_enabled(self, tab):
+        sid = _seed_session(tab._db, "running")
+        eng = _engine(session_id=sid)
+
+        def _aborted():
+            tp.update_session_status(tab._db, sid, "aborted")
+            eng.status = "idle"
+
+        eng.abort.side_effect = _aborted
+        tab._engine = eng
+        tab._set_running_state(True)
+        tab._on_abort()
+        assert tab._resume_btn.isEnabled()
+
+    def test_engine_side_abort_reenables_resume(self, tab):
+        sid = _seed_session(tab._db, "aborted")
+        tab._engine = _engine(status="idle", session_id=sid)
+        tab._set_running_state(True)
+        tab._on_status_changed("idle")
+        assert tab._resume_btn.isEnabled()
+
+    def test_completed_tune_keeps_its_status_label(self, tab):
+        _seed_session(tab._db, "aborted")  # an older session the user abandoned
+        tab._on_status_changed("idle")
+        assert tab._status_label.text() == "Status: Idle"
+        assert tab._resume_btn.isEnabled()
+
+    def test_idle_without_a_recoverable_session_keeps_resume_disabled(self, tab):
+        tab._set_running_state(True)
+        tab._on_status_changed("idle")
+        assert not tab._resume_btn.isEnabled()

@@ -706,6 +706,9 @@ class TunerTab(QWidget):
         if self._engine:
             self._engine.abort()
             self._set_running_state(False)
+            # The aborted session stays in the DB with every core's progress;
+            # offer it for Resume now, not only after an app restart.
+            self._check_resume()
             # Reset core sidebar states to each core's actual phase — abort
             # doesn't emit core_state_changed, and a blanket "pending" lied
             # about confirmed/hardened cores.
@@ -891,6 +894,10 @@ class TunerTab(QWidget):
             self._active_test_core = None
             self._tuner_timer.stop()
             self._set_running_state(False)
+            # An engine-side abort (or quarantine) leaves a recoverable session
+            # in the DB; re-enable Resume for it. The label is left alone: this
+            # branch also runs when a tune completes.
+            self._resume_btn.setEnabled(bool(self._db and self._db.list_recoverable_tuner_sessions()))
             if self._engine is not None:
                 for core_id, cs in self._engine.core_states.items():
                     self.tuner_core_testing.emit(core_id, _PHASE_TO_GRID[cs.phase])
@@ -1152,7 +1159,8 @@ class TunerTab(QWidget):
         return backend
 
     def _check_resume(self) -> None:
-        """Check for active tuner sessions on startup."""
+        """Enable Resume when the DB holds a recoverable session (startup, and
+        whenever the engine stops)."""
         if not self._db:
             return
         sessions = self._db.list_recoverable_tuner_sessions()
