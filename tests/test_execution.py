@@ -905,3 +905,129 @@ def test_scheduler_wrapped_kernel_stall_message_still_classifies_as_kernel_stall
     # re-classifies the message.
     msg = "Failure during rapid transition cycle 2: Kernel stall during stress: watchdog: BUG: soft lockup - CPU#5"
     assert classify_error(msg) == "kernel_stall"
+
+
+class TestImmediateStallResponse:
+    """Replays the 2026-11-03 freeze: the stalled CPU never runs again, so the
+    stress process cannot exit and the end-of-run cleanup hangs. The hook must
+    still fire from the supervisor thread at detection time."""
+
+    def _blocked_supervisor(self, tmp_path, monkeypatch, hook, release):
+        def blocked_kill(proc, **_kw):
+            release.wait(10)
+            proc.kill()
+            proc.wait()
+
+        monkeypatch.setattr(execution, "kill_process_group", blocked_kill)
+        monkeypatch.setattr(Supervisor, "_drain", lambda self, run: release.wait(10))
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        supervisor, _, _ = make_supervisor(backend, detector=LineDetector([_RCU_REPORT]))
+        supervisor.hooks = SuperviseHooks(on_kernel_stall=hook)
+        return supervisor
+
+    def test_hook_fires_while_the_run_cannot_finish(self, tmp_path, monkeypatch):
+        release = threading.Event()
+        calls = []
+        fired = threading.Event()
+
+        def hook(core_id, message, duration):
+            calls.append((core_id, message, duration))
+            fired.set()
+
+        supervisor = self._blocked_supervisor(tmp_path, monkeypatch, hook, release)
+        result = {}
+        t = threading.Thread(
+            target=lambda: result.update(v=run_one(supervisor, lane(tmp_path, 0, (0, 16)), 60.0)), daemon=True
+        )
+        t.start()
+        try:
+            assert fired.wait(2.0), "stall hook did not fire while the run's cleanup was blocked"
+            assert t.is_alive()  # the run is still stuck in cleanup
+            assert calls[0][0] == 0 and "rcu_preempt detected stalls" in calls[0][1]
+        finally:
+            release.set()
+            t.join(10)
+        assert result["v"].error_type == "kernel_stall"
+
+    def test_stress_is_sigkilled_at_detection_not_at_cleanup(self, tmp_path, monkeypatch):
+        killed = []
+        monkeypatch.setattr(execution, "sigkill_process_group", lambda proc: killed.append(proc.pid))
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        supervisor, _, _ = make_supervisor(backend, detector=LineDetector([_RCU_REPORT]))
+        seen_at_hook = []
+        supervisor.hooks = SuperviseHooks(on_kernel_stall=lambda *_a: seen_at_hook.append(list(killed)))
+        run_one(supervisor, lane(tmp_path, 0, (0, 16)), 60.0)
+        assert seen_at_hook and seen_at_hook[0], "SIGKILL must be sent before the hook runs"
+
+    def test_a_failing_hook_does_not_break_the_run(self, tmp_path):
+        def hook(*_a):
+            raise RuntimeError("boom")
+
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        supervisor, _, _ = make_supervisor(backend, detector=LineDetector([_RCU_REPORT]))
+        supervisor.hooks = SuperviseHooks(on_kernel_stall=hook)
+        verdict = run_one(supervisor, lane(tmp_path, 0, (0, 16)), 60.0)
+        assert verdict.error_type == "kernel_stall"
+
+    def test_stalled_lane_skips_the_drain_and_sigterm_grace(self, tmp_path, monkeypatch):
+        graces = []
+        real_kill = execution.kill_process_group
+
+        def spy(proc, **kw):
+            graces.append(kw.get("term_grace", 3.0))
+            real_kill(proc, **kw)
+
+        monkeypatch.setattr(execution, "kill_process_group", spy)
+        monkeypatch.setattr(Supervisor, "_drain", lambda self, run: pytest.fail("stalled lane must not be drained"))
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        supervisor, _, _ = make_supervisor(backend, detector=LineDetector([_RCU_REPORT]))
+        started = time.monotonic()
+        run_one(supervisor, lane(tmp_path, 0, (0, 16)), 60.0)
+        assert graces == [0]
+        assert time.monotonic() - started < 3.0
+
+    def test_unattributed_stall_still_kills_but_calls_no_hook(self, tmp_path):
+        calls = []
+        backend = FakeBackend(_child("import time; time.sleep(60)"))
+        report = [(100.0, "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:"), (100.0, "rcu: \t9-....: x")]
+        supervisor, _, _ = make_supervisor(backend, detector=LineDetector([report]))
+        supervisor.hooks = SuperviseHooks(on_kernel_stall=lambda *a: calls.append(a))
+        verdicts = supervisor.run([lane(tmp_path, 0, (0,)), lane(tmp_path, 5, (5,))], lambda _l: StressConfig(), 60.0)
+        assert verdicts[0].error_type == "mce_unattributed"
+        assert calls == []
+
+
+class TestIdleSegmentStall:
+    def test_watch_idle_calls_the_hook_for_the_core_under_test(self):
+        calls = []
+        msg = watch_idle(
+            cpus=(0, 16),
+            duration=5.0,
+            thermal=cool_thermal(),
+            detector=LineDetector([_RCU_REPORT]),
+            stop_event=threading.Event(),
+            observed=[],
+            phase="idle stability",
+            poll_interval=0.01,
+            core_id=0,
+            on_kernel_stall=lambda *a: calls.append(a),
+        )
+        assert msg is not None and classify_error(msg) == "kernel_stall"
+        assert [c[0] for c in calls] == [0] and "rcu_preempt" in calls[0][1]
+
+    def test_scheduler_idle_phase_passes_its_hook(self, topo_single_ccd):
+        from corecycler.engine.scheduler import CoreScheduler, SchedulerConfig
+
+        sched = CoreScheduler(
+            topology=topo_single_ccd,
+            backend=FakeBackend(),
+            stress_config=StressConfig(),
+            scheduler_config=SchedulerConfig(cores_to_test=[1]),
+        )
+        sched.detector = LineDetector([_RCU_REPORT])
+        sched._thermal = cool_thermal()
+        calls = []
+        sched.on_kernel_stall = lambda *a: calls.append(a)
+        error = sched._idle_phase(1, 5.0, "idle stability")
+        assert error is not None and "Kernel stall" in error
+        assert [c[0] for c in calls] == [1]

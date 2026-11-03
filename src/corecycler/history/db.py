@@ -159,6 +159,15 @@ class TelemetrySample:
 # ---------------------------------------------------------------------------
 
 
+_TUNER_TEST_LOG_INSERT = """\
+INSERT INTO tuner_test_log
+    (session_id, core_id, offset_tested, phase, passed,
+     error_message, error_type, duration_seconds, run_id,
+     backend, stress_mode, fft_preset, tested_at, peak_stretch_pct)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+"""
+
+
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
@@ -1539,13 +1548,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         peak_stretch_pct: float | None = None,
     ) -> int:
         cur = self.__conn.execute(
-            """\
-            INSERT INTO tuner_test_log
-                (session_id, core_id, offset_tested, phase, passed,
-                 error_message, error_type, duration_seconds, run_id,
-                 backend, stress_mode, fft_preset, tested_at, peak_stretch_pct)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
+            _TUNER_TEST_LOG_INSERT,
             (
                 session_id,
                 core_id,
@@ -1564,6 +1567,61 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             ),
         )
         return cur.lastrowid
+
+    @property
+    def path(self) -> Path:
+        return self._db_path
+
+    @classmethod
+    def insert_tuner_test_log_durable(
+        cls,
+        db_path: str | Path,
+        session_id: int,
+        core_id: int,
+        offset: int,
+        phase: str,
+        error_msg: str,
+        error_type: str,
+        duration: float,
+        *,
+        backend: str | None = None,
+        stress_mode: str | None = None,
+        fft_preset: str | None = None,
+    ) -> int:
+        """Insert one FAILED test row on a private connection and fsync it.
+
+        For a failure that may be followed by a frozen machine within seconds
+        (a kernel stall): callable from any thread, and it does not wait for
+        the main connection. synchronous=FULL makes the commit fsync the WAL,
+        so the row survives a hard reset without a checkpoint (a checkpoint
+        would wait on other connections' readers).
+        """
+        conn = sqlite3.connect(str(db_path), timeout=5.0, isolation_level=None)
+        try:
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            cur = conn.execute(
+                _TUNER_TEST_LOG_INSERT,
+                (
+                    session_id,
+                    core_id,
+                    offset,
+                    phase,
+                    0,
+                    error_msg,
+                    error_type,
+                    duration,
+                    None,
+                    backend,
+                    stress_mode,
+                    fft_preset,
+                    cls._now_iso(),
+                    None,
+                ),
+            )
+            return cur.lastrowid
+        finally:
+            conn.close()
 
     def get_tuner_test_log(self, session_id: int, core_id: int | None = None) -> list[dict]:
         if core_id is not None:

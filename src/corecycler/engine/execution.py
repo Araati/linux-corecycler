@@ -68,6 +68,10 @@ class SuperviseHooks:
     on_status: Callable[[int, float], None] | None = None
     on_stall: Callable[[int], None] | None = None
     on_thermal: Callable[[float], None] | None = None
+    # Called on the supervisor thread the moment a kernel stall is pinned on a
+    # lane: (core_id, message, seconds into the test). It must return at once;
+    # the machine may freeze seconds later, so nothing waits for the test to end.
+    on_kernel_stall: Callable[[int, str, float], None] | None = None
 
 
 # Highest max-temperature limit any caller may configure. Values above it are
@@ -166,18 +170,31 @@ def make_preexec():
     return _preexec
 
 
-def kill_process_group(proc: subprocess.Popen) -> None:
+def sigkill_process_group(proc: subprocess.Popen) -> None:
+    """Send SIGKILL to the stress process group. Never waits."""
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(OSError, ProcessLookupError):
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+
+
+def kill_process_group(proc: subprocess.Popen, *, term_grace: float = 3.0) -> None:
+    """SIGTERM, wait ``term_grace`` seconds, then SIGKILL. ``term_grace=0``
+    skips SIGTERM (a stalled run: a thread on a stuck CPU cannot exit)."""
     if proc.poll() is None:
         try:
             pgid = os.getpgid(proc.pid)
         except (OSError, ProcessLookupError):
             pgid = None
         if pgid is not None:
-            with contextlib.suppress(OSError, ProcessLookupError):
-                os.killpg(pgid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+            exited = False
+            if term_grace > 0:
+                with contextlib.suppress(OSError, ProcessLookupError):
+                    os.killpg(pgid, signal.SIGTERM)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=term_grace)
+                    exited = True
+            if not exited:
                 with contextlib.suppress(OSError, ProcessLookupError):
                     os.killpg(pgid, signal.SIGKILL)
                 with contextlib.suppress(subprocess.TimeoutExpired):
@@ -416,7 +433,45 @@ class Supervisor:
         # Always stop now, whatever stop_on_first_failure says: the stress
         # process must be killed before the stall turns into a freeze.
         self.stop_event.set()
+        self._respond_to_kernel_stall(runs, [(run, event) for run, event in targets.values()], start)
         return True
+
+    def _respond_to_kernel_stall(
+        self,
+        runs: list[_LaneRun],
+        targets: list[tuple[_LaneRun, MCEEvent]],
+        start: float,
+    ) -> None:
+        """Act on a stall now, from this thread: SIGKILL every lane (no
+        waiting), then hand each stalled core to the on_kernel_stall hook.
+
+        A stall can turn into a frozen machine within seconds. The normal end
+        of a run waits on the stress process (which cannot exit while one of
+        its threads sits on a stuck CPU) and then on the tuner's main thread,
+        so the response cannot wait for either.
+        """
+        for run in runs:
+            if run.proc is not None and run.proc.poll() is None:
+                self._we_killed = True
+                sigkill_process_group(run.proc)
+        elapsed = time.monotonic() - start
+        # The hook runs before anything is logged: a log write can block on a
+        # disk that the stall is freezing, and logging holds a lock.
+        for run, _event in targets:
+            if self.hooks.on_kernel_stall is None:
+                continue
+            try:
+                self.hooks.on_kernel_stall(run.lane.core_id, run.verdict.error_message, elapsed)
+            except Exception:
+                log.exception("kernel stall hook failed for core %d", run.lane.core_id)
+        for run, _event in targets:
+            log.info(
+                "Kernel stall on core %d (%s) %.1fs into the test: stress killed; %s",
+                run.lane.core_id,
+                self.phase,
+                elapsed,
+                "emergency CO restore and failure row started" if self.hooks.on_kernel_stall else "no stall hook",
+            )
 
     def _poll_backend_errors(self, runs: list[_LaneRun], start: float) -> bool:
         for run in runs:
@@ -574,6 +629,11 @@ class Supervisor:
         for run in runs:
             if run.proc is None:
                 continue
+            if run.verdict is not None and run.verdict.error_type == "kernel_stall":
+                # Already SIGKILLed at detection. Its output is not needed for
+                # the verdict, and waiting on it only delays the tuner.
+                kill_process_group(run.proc, term_grace=0)
+                continue
             self._drain(run)
             kill_process_group(run.proc)
         drained = self.detector.check_mce()
@@ -660,7 +720,12 @@ def watch_idle(
     observed: list[MCEEvent],
     phase: str,
     poll_interval: float = 0.5,
+    core_id: int | None = None,
+    on_kernel_stall: Callable[[int, str, float], None] | None = None,
 ) -> str | None:
+    """Watch an idle segment of the core under test. A kernel stall fails it
+    and, like the supervisor, triggers ``on_kernel_stall(core_id, ...)`` at once
+    (nothing runs to kill, but the tested CO value is still applied)."""
     own = set(cpus)
     start = time.monotonic()
     while time.monotonic() - start < duration and not stop_event.is_set():
@@ -672,7 +737,14 @@ def watch_idle(
             for event in events:
                 if event.kind == "kernel_stall":
                     # Idle phase of the core under test: any stall counts against it.
-                    return f"Kernel stall during {phase}: {event.message}"
+                    message = f"Kernel stall during {phase}: {event.message}"
+                    if on_kernel_stall is not None and core_id is not None:
+                        try:
+                            on_kernel_stall(core_id, message, time.monotonic() - start)
+                        except Exception:
+                            log.exception("kernel stall hook failed for core %d", core_id)
+                    log.info("Kernel stall on core %s during %s", core_id, phase)
+                    return message
             observed.extend(events)
             for event in events:
                 if event.cpu == -1 or event.cpu in own:

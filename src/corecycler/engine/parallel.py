@@ -10,9 +10,10 @@ from typing import TYPE_CHECKING
 from corecycler.config.paths import resolve_work_dir
 from corecycler.engine.backends.base import StressResult
 from corecycler.engine.detector import ErrorDetector, MCEEvent
-from corecycler.engine.execution import Lane, Supervisor, ThermalWatch
+from corecycler.engine.execution import Lane, SuperviseHooks, Supervisor, ThermalWatch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from corecycler.engine.backends.base import StressBackend
@@ -47,6 +48,8 @@ class ParallelStress:
         self.detector = ErrorDetector()
         self.observed_mce: list[MCEEvent] = []
         self._stop_event = threading.Event()
+        # Set by the tuner: see SuperviseHooks.on_kernel_stall.
+        self.on_kernel_stall: Callable[[int, str, float], None] | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -98,6 +101,7 @@ class ParallelStress:
             stall_timeout=self.config.stall_timeout,
             stop_on_first_failure=True,
             phase="parallel stress",
+            hooks=SuperviseHooks(on_kernel_stall=self.on_kernel_stall),
         )
 
         def config_for(lane: Lane):

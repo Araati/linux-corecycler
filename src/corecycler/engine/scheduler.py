@@ -17,6 +17,7 @@ from corecycler.engine.detector import ErrorDetector, MCEEvent
 from corecycler.engine.execution import Lane, SuperviseHooks, Supervisor, ThermalWatch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from corecycler.engine.backends.base import StressBackend
@@ -83,6 +84,9 @@ class CoreScheduler:
         self.config = scheduler_config
         self.work_dir = work_dir or resolve_work_dir()
         self.detector = ErrorDetector()
+        # Set by the tuner: called on the supervisor thread when a kernel
+        # stall fails a core (see SuperviseHooks.on_kernel_stall).
+        self.on_kernel_stall: Callable[[int, str, float], None] | None = None
 
         self.state = TestState.IDLE
         self.results: dict[int, list[StressResult]] = {}
@@ -180,6 +184,7 @@ class CoreScheduler:
                 on_status=self._hook_status,
                 on_stall=self._hook_stall,
                 on_thermal=self._hook_thermal,
+                on_kernel_stall=self.on_kernel_stall,
             ),
         )
 
@@ -312,6 +317,8 @@ class CoreScheduler:
                     stop_event=self._stop_event,
                     observed=self.observed_mce,
                     phase="idle transition",
+                    core_id=lane.core_id,
+                    on_kernel_stall=self.on_kernel_stall,
                 )
                 if idle_error:
                     if self.config.stop_on_error:
@@ -335,6 +342,8 @@ class CoreScheduler:
             stop_event=self._stop_event,
             observed=self.observed_mce,
             phase=phase_name,
+            core_id=core_id,
+            on_kernel_stall=self.on_kernel_stall,
         )
         if error:
             status = self.core_status.get(core_id)
@@ -405,6 +414,8 @@ class CoreScheduler:
                         stop_event=self._stop_event,
                         observed=self.observed_mce,
                         phase=f"idle phase of rapid transition cycle {cycle}",
+                        core_id=lane.core_id,
+                        on_kernel_stall=self.on_kernel_stall,
                     )
                     elapsed += time.monotonic() - segment_start
                     if idle_error:

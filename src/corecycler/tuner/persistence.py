@@ -8,6 +8,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from corecycler.history.db import HistoryDB
 
     from .config import TunerConfig
@@ -55,6 +57,38 @@ def get_active_session(db: HistoryDB) -> TunerSession | None:
 def save_core_state(db: HistoryDB, session_id: int, cs: CoreState) -> None:
     """Upsert a core state row."""
     db.upsert_tuner_core_state(session_id, cs)
+
+
+def log_test_failure_durable(
+    db_path: str | Path,
+    session_id: int,
+    core_id: int,
+    offset: int,
+    phase: str,
+    error_msg: str,
+    error_type: str,
+    duration: float,
+    *,
+    backend: str | None = None,
+    stress_mode: str | None = None,
+    fft_preset: str | None = None,
+) -> int:
+    """Write a failed test row from any thread, fsync'd (see HistoryDB)."""
+    from corecycler.history.db import HistoryDB
+
+    return HistoryDB.insert_tuner_test_log_durable(
+        db_path,
+        session_id,
+        core_id,
+        offset,
+        phase,
+        error_msg,
+        error_type,
+        duration,
+        backend=backend,
+        stress_mode=stress_mode,
+        fft_preset=fft_preset,
+    )
 
 
 def checkpoint(db: HistoryDB) -> None:

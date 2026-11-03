@@ -611,3 +611,10 @@ class TestStallReportStackDump:
 
         e = classify_mce_line("rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks: { 3-... }")
         assert e is not None and e.kind == "kernel_stall"
+
+
+def test_hard_lockup_is_an_unattributed_stall():
+    from corecycler.engine.detector import classify_mce_line
+
+    e = classify_mce_line("watchdog: CPU2: Watchdog detected hard LOCKUP on cpu 2")
+    assert e is not None and (e.kind, e.cpu) == ("kernel_stall", -1)

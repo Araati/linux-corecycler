@@ -39,6 +39,7 @@ from corecycler.smu.driver import core_map_blocked
 
 from . import persistence as tp
 from .config import TunerConfig
+from .stall_response import StallResponder, StallTarget
 from .state import CoreState, TunerPhase
 
 if TYPE_CHECKING:
@@ -468,6 +469,8 @@ class TunerEngine(QObject):
         self._abort_requested = False
         self._consecutive_start_failures = 0
         self._worker: _TunerWorker | None = None
+        # Immediate kernel-stall response for the test now running (see stall_response).
+        self._stall_responder: StallResponder | None = None
         self._last_tested_core: int | None = None
         self._ccd_last_tested: dict[int, int | None] = {}  # CCD index → last core_id tested in that CCD
         self._co_applied: dict[int, int | None] = {}  # core_id → last CO value written to SMU (None = unknown)
@@ -2383,6 +2386,64 @@ class TunerEngine(QObject):
             spectrum = tier.get("profile") == "spectrum"
         self._start_worker(core_id, duration, spectrum=spectrum)
 
+    def _attach_stall_responder(self, runner, cores: list[int], stress: tuple[str, str, str] | None) -> None:
+        """Give the worker's supervisor an immediate kernel-stall response:
+        restore the stalled core's CO and write its failure row from the
+        supervisor thread, without waiting for this (main) thread.
+
+        Everything it needs is captured here, at launch. ``stress`` is the
+        (backend, mode, fft) the row records; None means the session config
+        (what _log_parallel_rows records for simultaneous stages).
+        """
+        targets: dict[int, StallTarget] = {}
+        for core in cores:
+            cs = self._core_states.get(core)
+            if cs is None:
+                continue
+            backend, mode, fft = stress or (self._config.backend, self._config.stress_mode, self._config.fft_preset)
+            offset = self._co_applied.get(core)
+            if offset is None:
+                offset = cs.current_offset
+            targets[core] = StallTarget(
+                offset=offset,
+                baseline=cs.baseline_offset,
+                phase=self._log_phase(cs),
+                backend=backend,
+                stress_mode=mode,
+                fft_preset=fft,
+            )
+        db_path = getattr(self._db, "path", None) if self._db is not None else None
+        if db_path is not None and str(db_path) == ":memory:":
+            db_path = None
+        self._stall_responder = StallResponder(
+            smu=self._smu,
+            db_path=None if self._soaking else db_path,
+            session_id=self._session_id,
+            targets=targets,
+        )
+        runner.on_kernel_stall = self._stall_responder
+
+    def _stall_row_written(self, core_id: int) -> bool:
+        """True when the emergency path already recorded this test's kernel
+        stall row (the normal path must not add a second one). A write still
+        in progress after a short wait also counts: it holds the row."""
+        responder = self._stall_responder
+        if responder is None:
+            return False
+        # Longer than the emergency connection's 5 s busy timeout, so a write
+        # that gives up on a locked database is seen as failed, not pending.
+        status = responder.row_status(core_id, timeout=6.0)
+        if status == "pending":
+            log.warning("Kernel stall row for core %d still being written; not writing a second one", core_id)
+        return status in ("written", "pending")
+
+    def _stall_co_restore_settled(self, core_id: int) -> bool:
+        """False while this test's emergency CO restore is still running."""
+        responder = self._stall_responder
+        if responder is None:
+            return True
+        return responder.co_status(core_id, timeout=3.0) != "pending"
+
     def _fail_test_async(self, core_id: int, message: str) -> None:
         """Deliver a start-time failure on a fresh event-loop stack, like the
         worker's queued finished signal — never re-enter _on_test_finished
@@ -2453,6 +2514,7 @@ class TunerEngine(QObject):
             return
 
         logical_cpu = core_info.logical_cpus[0] if core_info.logical_cpus else core_id
+        self._attach_stall_responder(scheduler, [core_id], (backend_name, stress_mode_str, fft_preset_str))
         self._worker = _TunerWorker(
             core_id,
             logical_cpu,
@@ -2623,24 +2685,11 @@ class TunerEngine(QObject):
                 peak_stretch_pct,
             )
 
-        # Determine log phase
-        phase_map = {
-            TunerPhase.COARSE_SEARCH: "coarse",
-            TunerPhase.FINE_SEARCH: "fine",
-            TunerPhase.CONFIRMING: "confirm",
-            TunerPhase.BACKOFF_PRECONFIRM: "backoff_preconfirm",
-            TunerPhase.BACKOFF_CONFIRMING: "backoff_confirm",
-        }
-        if self._hunting:
-            log_phase = "hunt"
-        elif self._status == "validating" and self._validation_stage > 0:
-            log_phase = f"validate_s{self._validation_stage}"
-        else:
-            log_phase = phase_map.get(cs.phase, "validate" if self._status == "validating" else cs.phase)
+        log_phase = self._log_phase(cs)
 
         # Log to DB (soak is a session-level watch, not one core's test — its
         # record is the narrative plus any mce_evidence rows)
-        if self._session_id and not self._soaking:
+        if self._session_id and not self._soaking and not (kernel_stall and self._stall_row_written(core_id)):
             backend, stress_mode, fft_preset = self._get_active_stress_config(cs)
             tp.log_test_result(
                 self._db,
@@ -2671,6 +2720,18 @@ class TunerEngine(QObject):
             + (f" ({error_msg})" if error_msg else "")
         )
         self.test_completed.emit(core_id, cs.current_offset, passed)
+
+        if kernel_stall and not self._stall_co_restore_settled(core_id):
+            # The emergency baseline write is still queued on the SMU. Any CO
+            # write from here (back-off, next test) could land BEFORE it and be
+            # overwritten, so the next test would run at baseline while being
+            # recorded at its offset. Stop instead of advancing.
+            self.log_message.emit(
+                f"Core {core_id}: the emergency CO restore after the kernel stall has not "
+                f"finished. Pausing so no later CO write can be overwritten by it."
+            )
+            self.pause()
+            return
 
         # Revert tested core to baseline — no aggressive offset should linger.
         # Skip during validation (all confirmed offsets stay applied) and during
@@ -2782,6 +2843,23 @@ class TunerEngine(QObject):
         # into _on_test_finished.
         QTimer.singleShot(0, self._run_next)
 
+    def _log_phase(self, cs: CoreState) -> str:
+        """The tuner_test_log phase label for a test of ``cs`` right now."""
+        phase_map = {
+            TunerPhase.COARSE_SEARCH: "coarse",
+            TunerPhase.FINE_SEARCH: "fine",
+            TunerPhase.CONFIRMING: "confirm",
+            TunerPhase.BACKOFF_PRECONFIRM: "backoff_preconfirm",
+            TunerPhase.BACKOFF_CONFIRMING: "backoff_confirm",
+        }
+        if self._hunting:
+            log_phase = "hunt"
+        elif self._status == "validating" and self._validation_stage > 0:
+            log_phase = f"validate_s{self._validation_stage}"
+        else:
+            log_phase = phase_map.get(cs.phase, "validate" if self._status == "validating" else cs.phase)
+        return log_phase
+
     def _log_parallel_rows(self, reported: int, results_json: str, phase: str) -> None:
         """Record every lane's verdict from a simultaneous stage, not only the
         reported core's. Fail closed: a malformed payload records nothing."""
@@ -2804,6 +2882,8 @@ class TunerEngine(QObject):
                 continue
             cs = self._core_states.get(core)
             if cs is None:
+                continue
+            if e.get("error_type") == "kernel_stall" and self._stall_row_written(core):
                 continue
             offset = self._co_applied.get(core)
             if offset is None:
@@ -3299,6 +3379,7 @@ class TunerEngine(QObject):
 
         self._last_tested_core = cores[0]
         self._mark_cores_under_stress(cores)
+        self._attach_stall_responder(scheduler, cores, None)
         core_info = self._topology.cores.get(cores[0])
         logical_cpu = core_info.logical_cpus[0] if core_info and core_info.logical_cpus else cores[0]
         self._worker = _RapidTransitionWorker(
@@ -3614,6 +3695,7 @@ class TunerEngine(QObject):
             self._fail_test_async(cores[0], str(e))
             return
 
+        self._attach_stall_responder(runner, cores, None)
         core_info = self._topology.cores.get(cores[0])
         logical_cpu = core_info.logical_cpus[0] if core_info and core_info.logical_cpus else cores[0]
         self._worker = _ParallelWorker(cores[0], logical_cpu, runner, parent=self)

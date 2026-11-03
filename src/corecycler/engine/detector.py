@@ -70,6 +70,10 @@ _SOFT_LOCKUP_RE = re.compile(r"\bsoft lockup\b.*?\bcpu#(\d+)", re.IGNORECASE)
 # "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:" and
 # "rcu: INFO: rcu_sched self-detected stall on CPU" (rcu_sched on non-preempt kernels)
 _RCU_STALL_RE = re.compile(r"\brcu_\w+ (?:self-)?detected (?:expedited )?stalls?\b", re.IGNORECASE)
+# "watchdog: CPU2: Watchdog detected hard LOCKUP on cpu 2". The named CPU is
+# often a victim (it spun on a lock the stuck CPU holds), so it is never
+# attributed: cpu=-1.
+_HARD_LOCKUP_RE = re.compile(r"\bwatchdog detected hard lockup\b", re.IGNORECASE)
 # Per-CPU line that follows an RCU stall header: "rcu: \t3-....: (20999 ticks this GP) ..."
 # The "(detected by N, ...)" line names the CPU that NOTICED the stall and never matches.
 _RCU_STALL_CPU_RE = re.compile(r"^(?:rcu:)?\s+(\d+)-\S*:")
@@ -83,7 +87,7 @@ def _stall_event(body: str) -> MCEEvent | None:
     m = _SOFT_LOCKUP_RE.search(body)
     if m:
         cpu = int(m.group(1))
-    elif _RCU_STALL_RE.search(body):
+    elif _RCU_STALL_RE.search(body) or _HARD_LOCKUP_RE.search(body):
         cpu = -1
     else:
         return None
@@ -113,7 +117,7 @@ def events_from_lines(lines: list[tuple[float, str]]) -> list[MCEEvent]:
         if event is None:
             continue
         event.raw_ts = raw_ts
-        if event.kind == "kernel_stall" and event.cpu == -1:
+        if event.kind == "kernel_stall" and event.cpu == -1 and _RCU_STALL_RE.search(body):
             inline = _RCU_INLINE_CPUS_RE.search(body)
             cpus = [int(n) for n in re.findall(r"(\d+)-", inline.group(1))] if inline else []
             while i < len(lines):
