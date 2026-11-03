@@ -72,6 +72,8 @@ class AppSettings:
     notify_on_completion: bool = True
     # Auto-Tuner panel (TunerConfig JSON); empty = TunerConfig defaults
     tuner_config_json: str = ""
+    # Lower kernel RCU-stall / lockup thresholds to 5 s while the tuner runs
+    fast_stall_detection: bool = False
 
     @property
     def active_profile(self) -> TestProfile:

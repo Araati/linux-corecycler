@@ -473,6 +473,7 @@ class TestEngineInitiatedStops:
         ns._export_btn = MagicMock()
         ns._notify = MagicMock()
         ns._db = None
+        ns._sync_fast_stall = MagicMock()
         return ns
 
     def test_engine_self_abort_reenables_ui(self):

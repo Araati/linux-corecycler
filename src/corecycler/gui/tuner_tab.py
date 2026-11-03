@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from corecycler.engine.backends.base import FFTPreset, StressMode
+from corecycler.engine.kernel_watchdog import FastStallDetection
 from corecycler.gui.style import PHASE_TO_GRID, button_qss, phase_label, status_label, theme
 from corecycler.gui.tool_prompt import ensure_tool
 from corecycler.history.db import RESUMABLE_STATUSES
@@ -70,6 +71,9 @@ class TunerTab(QWidget):
     # Emitted when the user edits the config panel (not when a session's saved
     # config is shown on Resume) so MainWindow can persist it.
     config_edited = Signal()
+    # The fast-stall checkbox is an app setting, not part of the tuner config
+    # panel, so it does not trigger a capture of the (possibly session) panel.
+    fast_stall_changed = Signal()
 
     def __init__(
         self,
@@ -90,6 +94,7 @@ class TunerTab(QWidget):
         # None (standalone tab, tests) keeps the TunerConfig/session value.
         self._max_temperature_source: Callable[[], float] | None = None
         self._showing_session_config = False
+        self._fast_stall = FastStallDetection()
 
         self._tuner_timer = QTimer(self)
         self._tuner_timer.timeout.connect(self._tick_tuner)
@@ -393,6 +398,16 @@ class TunerTab(QWidget):
         )
         stress_layout.addRow("FFT preset:", self._fft_combo)
 
+        self._fast_stall_check = QCheckBox("Fast kernel stall detection")
+        self._fast_stall_check.setToolTip(
+            "While the tuner runs, lower rcu_cpu_stall_timeout and watchdog_thresh to 5 s\n"
+            "so an unstable offset is reported as an RCU stall / soft lockup within seconds.\n"
+            "The original values are restored when tuning pauses or stops (a reboot resets\n"
+            "them anyway). If softlockup_panic, hardlockup_panic or panic_on_rcu_stall is 1,\n"
+            "a short stall then panics and reboots the machine instead of warning."
+        )
+        stress_layout.addRow("", self._fast_stall_check)
+
         right_col.addWidget(stress_group)
 
         timing_group = QGroupBox("Timing")
@@ -443,7 +458,10 @@ class TunerTab(QWidget):
         for w in c.findChildren(QComboBox):
             w.currentTextChanged.connect(self._on_config_edited)
         for w in c.findChildren(QCheckBox):
-            w.toggled.connect(self._on_config_edited)
+            if w is self._fast_stall_check:
+                w.toggled.connect(self.fast_stall_changed)
+            else:
+                w.toggled.connect(self._on_config_edited)
 
     def _on_config_edited(self, *_args) -> None:
         if not self._showing_session_config:
@@ -456,6 +474,24 @@ class TunerTab(QWidget):
     def load_panel_config(self, data: str) -> None:
         """Show a persisted panel config (startup)."""
         self._apply_config_to_ui(TunerConfig.from_json(data))
+
+    @property
+    def fast_stall_detection(self) -> bool:
+        return self._fast_stall_check.isChecked()
+
+    def set_fast_stall_detection(self, enabled: bool) -> None:
+        self._fast_stall_check.setChecked(enabled)
+
+    def _sync_fast_stall(self, running: bool) -> None:
+        """Lower the kernel stall thresholds while tuning; restore otherwise."""
+        if running and self._fast_stall_check.isChecked():
+            messages = self._fast_stall.apply()
+        elif not running and self._fast_stall.active:
+            messages = self._fast_stall.restore()
+        else:
+            return
+        for m in messages:
+            self._on_log_message(m)
 
     def set_max_temperature_source(self, source: Callable[[], float] | None) -> None:
         """Use the Configuration tab's max temperature for every tuner run."""
@@ -926,6 +962,7 @@ class TunerTab(QWidget):
         if status == "paused":
             self._pause_btn.setEnabled(False)
             self._resume_btn.setEnabled(True)
+            self._sync_fast_stall(False)
         elif status in ("running", "validating", "hunting"):
             self._pause_btn.setEnabled(True)
             self._resume_btn.setEnabled(False)
@@ -1176,6 +1213,7 @@ class TunerTab(QWidget):
         self._resume_btn.setEnabled(False)
         self._abort_btn.setEnabled(running)
         self._config_container.setEnabled(not running)
+        self._sync_fast_stall(running)
         if running:
             self._validate_btn.setEnabled(False)
             self._export_btn.setEnabled(False)
@@ -1238,6 +1276,7 @@ class TunerTab(QWidget):
         """Force-stop the tuner engine and its worker — called on app exit."""
         if self._engine:
             self._engine.abort()
+        self._sync_fast_stall(False)
 
     @property
     def is_running(self) -> bool:

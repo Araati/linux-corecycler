@@ -652,3 +652,30 @@ class TestSettingsPersistOnEdit:
         assert win._tuner_tab._backend_combo.currentText() == "stress-ng"
         assert win._tuner_tab._get_config().max_thermal_retries == 9
         win._history_db = None
+
+
+class TestFastStallSetting:
+    @pytest.fixture(autouse=True)
+    def _all_backends(self):
+        from corecycler.engine.backends import load_all
+
+        load_all()
+
+    def test_toggle_after_resume_saves_the_checkbox_but_not_the_session_panel(self, monkeypatch, tmp_path, db):
+        settings = _settings(tmp_path, tuner_config_json=TunerConfig(backend="stress-ng").to_json())
+        win = _build(monkeypatch, tmp_path, db=db, settings=settings)
+        tab = win._tuner_tab
+        tab._showing_session_config = True  # what Resume does with an mprime session
+        try:
+            tab._apply_config_to_ui(TunerConfig(backend="mprime"))
+        finally:
+            tab._showing_session_config = False
+
+        tab._fast_stall_check.setChecked(True)
+        assert win._settings_save_timer.isActive()
+        win._settings_save_timer.timeout.emit()
+
+        saved = mw.save_settings.call_args.args[0]
+        assert saved.fast_stall_detection is True
+        assert TunerConfig.from_json(saved.tuner_config_json).backend == "stress-ng"
+        win._history_db = None

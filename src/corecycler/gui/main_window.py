@@ -218,6 +218,7 @@ class MainWindow(QMainWindow):
         self._tuner_tab.set_max_temperature_source(lambda: self._config_tab.get_profile().max_temperature)
         if self._settings.tuner_config_json:
             self._tuner_tab.load_panel_config(self._settings.tuner_config_json)
+        self._tuner_tab.set_fast_stall_detection(self._settings.fast_stall_detection)
         # The panel as the user last edited it. A Resume shows the session's
         # config in the panel; that must not end up in settings.json, so the
         # saved panel is captured on user edits only.
@@ -230,6 +231,7 @@ class MainWindow(QMainWindow):
         self._settings_save_timer.timeout.connect(self._persist_settings)
         self._config_tab.profile_edited.connect(self._settings_save_timer.start)
         self._tuner_tab.config_edited.connect(self._on_tuner_config_edited)
+        self._tuner_tab.fast_stall_changed.connect(self._settings_save_timer.start)
         self._tuner_tab.tuner_running_changed.connect(self._on_tuner_running_changed)
         self._tuner_tab.tuner_core_testing.connect(self._on_tuner_core_update)
         self._tuner_tab.tuner_core_elapsed.connect(self._on_tuner_core_elapsed)
@@ -882,6 +884,7 @@ class MainWindow(QMainWindow):
             self._settings.profiles = [profile]
             self._settings.active_profile_idx = 0
         self._settings.tuner_config_json = self._tuner_config_json
+        self._settings.fast_stall_detection = self._tuner_tab.fast_stall_detection
         try:
             save_settings(self._settings)
         except OSError as e:

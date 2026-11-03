@@ -795,3 +795,17 @@ def no_host_kmsg(monkeypatch, tmp_path_factory):
     from corecycler.engine import detector as detector_mod
 
     monkeypatch.setattr(detector_mod, "KMSG_PATH", str(tmp_path_factory.mktemp("kmsg") / "absent"))
+
+
+@pytest.fixture(autouse=True)
+def fake_kernel_watchdog_knobs(monkeypatch, tmp_path_factory):
+    """The fast-stall checkbox writes kernel knobs; tests get files in tmp."""
+    from corecycler.engine import kernel_watchdog as kw
+
+    base = tmp_path_factory.mktemp("knobs")
+    for name, value in (("rcu_cpu_stall_timeout", "60"), ("watchdog_thresh", "10")):
+        (base / name).write_text(value)
+    monkeypatch.setattr(kw, "RCU_STALL_TIMEOUT", base / "rcu_cpu_stall_timeout")
+    monkeypatch.setattr(kw, "WATCHDOG_THRESH", base / "watchdog_thresh")
+    monkeypatch.setattr(kw, "PANIC_KNOBS", ())
+    return base
