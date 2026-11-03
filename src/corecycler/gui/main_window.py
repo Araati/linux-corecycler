@@ -216,6 +216,20 @@ class MainWindow(QMainWindow):
         smu = self._smu_tab.smu if hasattr(self._smu_tab, "smu") else None
         self._tuner_tab = TunerTab(self._history_db, self._topology, smu)
         self._tuner_tab.set_max_temperature_source(lambda: self._config_tab.get_profile().max_temperature)
+        if self._settings.tuner_config_json:
+            self._tuner_tab.load_panel_config(self._settings.tuner_config_json)
+        # The panel as the user last edited it. A Resume shows the session's
+        # config in the panel; that must not end up in settings.json, so the
+        # saved panel is captured on user edits only.
+        self._tuner_config_json = self._tuner_tab.panel_config_json()
+        # Persist every settings edit right away (short debounce so holding a
+        # spinbox arrow doesn't fsync dozens of times); closeEvent saves too.
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(300)
+        self._settings_save_timer.timeout.connect(self._persist_settings)
+        self._config_tab.profile_edited.connect(self._settings_save_timer.start)
+        self._tuner_tab.config_edited.connect(self._on_tuner_config_edited)
         self._tuner_tab.tuner_running_changed.connect(self._on_tuner_running_changed)
         self._tuner_tab.tuner_core_testing.connect(self._on_tuner_core_update)
         self._tuner_tab.tuner_core_elapsed.connect(self._on_tuner_core_elapsed)
@@ -852,6 +866,27 @@ class MainWindow(QMainWindow):
         log.info("auto-resume: resuming session %d (%s)", session.id, session.status)
         self._tuner_tab._resume_session(session.id)
 
+    def _on_tuner_config_edited(self) -> None:
+        self._tuner_config_json = self._tuner_tab.panel_config_json()
+        self._settings_save_timer.start()
+
+    def _persist_settings(self) -> None:
+        """Write the Configuration tab and Auto-Tuner panel to settings.json."""
+        self._settings_save_timer.stop()
+        profile = self._config_tab.get_profile()
+        idx = self._settings.active_profile_idx
+        if 0 <= idx < len(self._settings.profiles):
+            profile.name = self._settings.profiles[idx].name
+            self._settings.profiles[idx] = profile
+        else:
+            self._settings.profiles = [profile]
+            self._settings.active_profile_idx = 0
+        self._settings.tuner_config_json = self._tuner_config_json
+        try:
+            save_settings(self._settings)
+        except OSError as e:
+            log.warning("Could not save settings: %s", e)
+
     def closeEvent(self, event) -> None:
         # Check if ANYTHING is running (manual test OR tuner OR memory stress)
         self._closing = True
@@ -915,7 +950,7 @@ class MainWindow(QMainWindow):
         # save window size
         self._settings.window_width = self.width()
         self._settings.window_height = self.height()
-        save_settings(self._settings)
+        self._persist_settings()
 
         self._monitor_tab.stop_monitoring()
         if self._msr:

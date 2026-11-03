@@ -388,3 +388,25 @@ class TestCorruptSettingsPreserved:
         assert loaded.work_dir == settings_mod.AppSettings().work_dir  # defaults
         assert not bad.exists()  # moved, not deleted
         assert (tmp_path / "settings.json.corrupt").read_text() == "{not valid json"
+
+
+class TestAtomicWriteDurability:
+    def test_atomic_write_fsyncs_file_and_directory(self, tmp_path, monkeypatch):
+        import os
+
+        from corecycler.config import paths
+
+        synced = []
+        real_fsync = os.fsync
+        monkeypatch.setattr(paths.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd)))
+        target = tmp_path / "settings.json"
+        paths.atomic_write(target, '{"a": 1}')
+        assert target.read_text() == '{"a": 1}'
+        assert len(synced) == 2  # temp file, then the directory entry
+        assert not (tmp_path / "settings.tmp").exists()
+
+    def test_tuner_panel_round_trips(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("corecycler.config.settings.CONFIG_DIR", tmp_path)
+        s = AppSettings(tuner_config_json='{"backend":"stress-ng"}')
+        save_settings(s)
+        assert load_settings().tuner_config_json == '{"backend":"stress-ng"}'

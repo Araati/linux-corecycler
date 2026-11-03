@@ -175,3 +175,28 @@ class TestRetestFailed:
         tab = _tab()
         tab.set_failed_cores([])
         assert not tab._retest_failed_btn.isEnabled()
+
+
+class TestProfileEdited:
+    """Every user edit is announced so it can be saved; loading a profile is not."""
+
+    def test_each_input_emits_profile_edited(self):
+        tab = _tab()
+        edits = []
+        tab.profile_edited.connect(lambda: edits.append(1))
+        tab._fft_combo.setCurrentText("LARGE")
+        tab._backend_combo.setCurrentIndex((tab._backend_combo.currentIndex() + 1) % tab._backend_combo.count())
+        tab._max_temp_spin.setValue(100.0)
+        tab._time_spin.setValue(999)
+        tab._mode_combo.setCurrentText("QUICK")
+        assert len(edits) >= 5
+
+    def test_set_profile_is_silent_and_keeps_the_preset(self):
+        from corecycler.config.settings import TestProfile
+
+        tab = _tab()
+        edits = []
+        tab.profile_edited.connect(lambda: edits.append(1))
+        tab.set_profile(TestProfile(test_mode="THOROUGH", seconds_per_core=1800, cycle_count=2, idle_between_cores=5))
+        assert edits == []
+        assert tab.get_profile().test_mode == "THOROUGH"

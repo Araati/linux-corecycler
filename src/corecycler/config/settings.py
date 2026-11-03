@@ -70,6 +70,8 @@ class AppSettings:
     history_retention_days: int = 90
     # Notifications
     notify_on_completion: bool = True
+    # Auto-Tuner panel (TunerConfig JSON); empty = TunerConfig defaults
+    tuner_config_json: str = ""
 
     @property
     def active_profile(self) -> TestProfile:

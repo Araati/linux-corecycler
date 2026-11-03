@@ -27,10 +27,24 @@ def user_home() -> Path:
 
 
 def atomic_write(path: Path, content: str) -> None:
-    """Write via temp file + rename, then hand the file back to the user."""
+    """Write via temp file + fsync + rename + directory fsync, then hand the
+    file back to the user.
+
+    Without the fsyncs a hard reset shortly after a save can leave an empty
+    or missing file even though the rename "happened": the data and the
+    directory entry were still only in the page cache.
+    """
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(content, encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
+    dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     fix_sudo_ownership(path.parent, path)
 
 

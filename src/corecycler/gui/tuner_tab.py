@@ -67,6 +67,9 @@ class TunerTab(QWidget):
     tuner_core_testing = Signal(int, str)  # core_id, state ("testing"/"passed"/"failed"/etc)
     tuner_core_elapsed = Signal(int, float)  # core_id, elapsed_seconds
     tuner_core_info = Signal(int, int, str)  # core_id, co_offset, phase — for sidebar enrichment
+    # Emitted when the user edits the config panel (not when a session's saved
+    # config is shown on Resume) so MainWindow can persist it.
+    config_edited = Signal()
 
     def __init__(
         self,
@@ -86,6 +89,7 @@ class TunerTab(QWidget):
         # Returns the Configuration tab's max temperature; set by MainWindow.
         # None (standalone tab, tests) keeps the TunerConfig/session value.
         self._max_temperature_source: Callable[[], float] | None = None
+        self._showing_session_config = False
 
         self._tuner_timer = QTimer(self)
         self._tuner_timer.timeout.connect(self._tick_tuner)
@@ -125,6 +129,7 @@ class TunerTab(QWidget):
         config_inner.setContentsMargins(0, 0, 0, 0)
         config_inner.setSpacing(8)
         self._build_config_panel(config_inner)
+        self._connect_config_edits()
         top_layout.addWidget(self._config_container)
 
         # Action buttons
@@ -430,6 +435,28 @@ class TunerTab(QWidget):
         btn_row.addStretch()
         parent_layout.addLayout(btn_row)
 
+    def _connect_config_edits(self) -> None:
+        """Route every config-panel input to config_edited."""
+        c = self._config_container
+        for w in c.findChildren(QSpinBox) + c.findChildren(QDoubleSpinBox):
+            w.valueChanged.connect(self._on_config_edited)
+        for w in c.findChildren(QComboBox):
+            w.currentTextChanged.connect(self._on_config_edited)
+        for w in c.findChildren(QCheckBox):
+            w.toggled.connect(self._on_config_edited)
+
+    def _on_config_edited(self, *_args) -> None:
+        if not self._showing_session_config:
+            self.config_edited.emit()
+
+    def panel_config_json(self) -> str:
+        """The config panel as JSON, for persisting across restarts."""
+        return self._panel_config().to_json()
+
+    def load_panel_config(self, data: str) -> None:
+        """Show a persisted panel config (startup)."""
+        self._apply_config_to_ui(TunerConfig.from_json(data))
+
     def set_max_temperature_source(self, source: Callable[[], float] | None) -> None:
         """Use the Configuration tab's max temperature for every tuner run."""
         self._max_temperature_source = source
@@ -438,7 +465,14 @@ class TunerTab(QWidget):
         return self._max_temperature_source() if self._max_temperature_source else None
 
     def _get_config(self) -> TunerConfig:
-        cfg = TunerConfig(
+        cfg = self._panel_config()
+        max_temp = self._max_temperature()
+        if max_temp is not None:
+            cfg.max_temperature_c = max_temp
+        return cfg
+
+    def _panel_config(self) -> TunerConfig:
+        return TunerConfig(
             start_offset=self._start_offset_spin.value(),
             coarse_step=self._coarse_step_spin.value(),
             fine_step=self._fine_step_spin.value(),
@@ -456,10 +490,6 @@ class TunerTab(QWidget):
             stress_mode=self._mode_combo.currentText(),
             fft_preset=self._fft_combo.currentText(),
         )
-        max_temp = self._max_temperature()
-        if max_temp is not None:
-            cfg.max_temperature_c = max_temp
-        return cfg
 
     def _load_defaults(self) -> None:
         self._apply_config_to_ui(TunerConfig())
@@ -660,14 +690,27 @@ class TunerTab(QWidget):
             )
             return
 
-        # Create engine if needed (cold start resume)
+        if self._engine is None and (not self._db or not self._topology):
+            QMessageBox.warning(self, "Error", "Database or topology not available")
+            return
+
+        # The engine runs the session's SAVED config — mirror it into the
+        # config panel so the boxes show what is actually being executed. This
+        # must happen BEFORE the backend is built from the combo box, or a
+        # session saved with one backend is run with whatever the combo showed.
+        # Not a user edit: the persisted panel settings are left alone.
+        session = tp.get_session(self._db, session_id) if self._db else None
+        if session is not None:
+            self._showing_session_config = True
+            try:
+                self._apply_config_to_ui(TunerConfig.from_json(session.config_json))
+            finally:
+                self._showing_session_config = False
+
+        backend = self._get_backend()
+        if backend is None:
+            return
         if self._engine is None:
-            if not self._db or not self._topology:
-                QMessageBox.warning(self, "Error", "Database or topology not available")
-                return
-            backend = self._get_backend()
-            if backend is None:
-                return
             self._engine = TunerEngine(
                 db=self._db,
                 topology=self._topology,
@@ -675,12 +718,8 @@ class TunerTab(QWidget):
                 backend=backend,
             )
             self._wire_engine()
-
-        # The engine runs the session's SAVED config — mirror it into the
-        # config panel so the boxes show what is actually being executed.
-        session = tp.get_session(self._db, session_id) if self._db else None
-        if session is not None:
-            self._apply_config_to_ui(TunerConfig.from_json(session.config_json))
+        else:
+            self._engine.set_backend(backend)
         log.info("Resuming tuner session %d with its saved config", session_id)
         for event in tp.get_events(self._db, session_id, limit=20):
             log.info(
@@ -725,6 +764,7 @@ class TunerTab(QWidget):
         backend = self._get_backend()
         if backend is None:
             return
+        self._engine.set_backend(backend)
         self._engine.validate_profile(self._engine.session_id, max_temperature_c=self._max_temperature())
         if self._engine.status not in ACTIVE_STATUSES:
             QMessageBox.warning(

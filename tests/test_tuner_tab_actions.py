@@ -823,3 +823,36 @@ class TestAbortLeavesResumable:
         tab._set_running_state(True)
         tab._on_status_changed("idle")
         assert not tab._resume_btn.isEnabled()
+
+
+class TestResumeBackend:
+    """Resume runs the session's saved backend, and showing the session's
+    config does not overwrite the user's persisted panel settings."""
+
+    def test_resume_builds_the_sessions_backend_without_saving_the_panel(self, db):
+        requested = []
+
+        def factory(name):
+            requested.append(name)
+            return _backend()
+
+        tab = _tab(db=db, topology=_topo(), smu=_smu(), backend_factory=factory)
+        tab._backend_combo.setCurrentText("mprime")
+        sid = tp.create_session(db, TunerConfig(backend="stress-ng"), bios_version="", cpu_model="")
+        tp.update_session_status(db, sid, "paused")
+        eng = _engine(status="paused", session_id=sid)
+        tab._engine = eng
+        edits = []
+        tab.config_edited.connect(lambda: edits.append(1))
+
+        tab._resume_session(sid)
+
+        assert requested == ["stress-ng"]
+        eng.set_backend.assert_called_once()
+        assert edits == []
+
+    def test_a_user_edit_emits_config_edited(self, tab):
+        edits = []
+        tab.config_edited.connect(lambda: edits.append(1))
+        tab._backend_combo.setCurrentText("stress-ng")
+        assert edits

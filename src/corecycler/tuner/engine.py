@@ -588,6 +588,7 @@ class TunerEngine(QObject):
             self._co_applied[core_id] = None  # unknown — SMU state not yet managed
 
         self._set_status("running")
+        self.log_message.emit(f"Stress backend: {self._backend.name}")
         self.log_message.emit(
             f"Started tuner session {self._session_id} — "
             f"{len(cores)} cores, coarse step {self._config.coarse_step}, "
@@ -660,6 +661,7 @@ class TunerEngine(QObject):
             return
 
         self._core_states = tp.load_core_states(self._db, session_id)
+        self.log_message.emit(f"Stress backend: {self._backend.name}")
 
         # Resume is the user's answer to a thermal pause (cooling fixed, limit
         # raised): thermal retry streaks start fresh, or a session stopped at
@@ -879,6 +881,17 @@ class TunerEngine(QObject):
             tp.update_session_status(self._db, session_id, "running")
             self.log_message.emit(f"Resumed session {session_id}")
             self._run_next()
+
+    def set_backend(self, backend: StressBackend) -> None:
+        """Replace the primary stress backend (GUI: the Stress Test box).
+
+        Ignored while a test is running, so a live worker never has its
+        backend swapped underneath it.
+        """
+        if self._worker is not None and self._worker.isRunning():
+            self.log_message.emit("Backend change ignored: a test is still running.")
+            return
+        self._backend = backend
 
     def _override_max_temperature(self, max_temperature_c: float | None) -> None:
         """Replace the saved thermal limit with the caller's current one."""

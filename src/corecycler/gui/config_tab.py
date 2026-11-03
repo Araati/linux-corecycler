@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -43,6 +44,9 @@ TEST_MODE_INFO: dict[str, str] = {
 
 class ConfigTab(QWidget):
     """Configuration panel for stress test settings."""
+
+    # Emitted after the user changes any setting (not while a profile loads)
+    profile_edited = Signal()
 
     def __init__(self, topology: CPUTopology | None = None) -> None:
         super().__init__()
@@ -251,6 +255,7 @@ class ConfigTab(QWidget):
             self._on_change()
             return
 
+        was_building = self._building
         self._building = True
         match mode_name:
             case "QUICK":
@@ -277,7 +282,11 @@ class ConfigTab(QWidget):
                 self._variable_load.setChecked(True)
                 self._idle_stability_spin.setValue(60)
                 self._idle_between_spin.setValue(10)
-        self._building = False
+        # Restore, not clear: set_profile() calls this mid-load and must stay
+        # in building mode until every field is applied.
+        self._building = was_building
+        if not self._building:
+            self.profile_edited.emit()
 
     def _on_fft_change(self) -> None:
         is_custom = self._fft_combo.currentText() == "CUSTOM"
@@ -335,6 +344,7 @@ class ConfigTab(QWidget):
             self._mode_combo.setCurrentText("CUSTOM")
             self._mode_desc.setText(TEST_MODE_INFO["CUSTOM"])
             self._building = False
+        self.profile_edited.emit()
 
     def get_profile(self) -> TestProfile:
         cores_text = self._cores_input.text().strip().rstrip(",").strip()

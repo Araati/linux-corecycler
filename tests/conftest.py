@@ -778,3 +778,11 @@ def assume_clean_shutdown(monkeypatch):
     import corecycler.tuner.engine as engine_mod
 
     monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0: True)
+
+
+@pytest.fixture(autouse=True)
+def isolated_config_dir(monkeypatch, tmp_path_factory):
+    """Settings save on every edit; no test may write the real ~/.config/corecycler."""
+    from corecycler.config import settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "CONFIG_DIR", tmp_path_factory.mktemp("config"))

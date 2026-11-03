@@ -586,3 +586,69 @@ class TestCloseEvent:
         window.closeEvent(event)
         assert window._tuner_tab.force_stop.called
         assert event.accept.called
+
+
+class TestSettingsPersistOnEdit:
+    """Settings are written when edited, not only on a clean exit, so a hard
+    reboot keeps them."""
+
+    @pytest.fixture(autouse=True)
+    def _all_backends(self):
+        # _build mocks load_all; these tests pick backends from the combo box.
+        from corecycler.engine.backends import load_all
+
+        load_all()
+
+    def test_config_and_tuner_edits_are_saved(self, monkeypatch, tmp_path, db):
+        win = _build(monkeypatch, tmp_path, db=db)
+        cfg = win._config_tab
+        cfg._max_temp_spin.setValue(100.0)
+        cfg._fft_combo.setCurrentText("LARGE")
+        cfg._time_spin.setValue(900)
+        win._tuner_tab._backend_combo.setCurrentText("stress-ng")
+        win._tuner_tab._thermal_retries_spin.setValue(7)
+        assert win._settings_save_timer.isActive()  # debounced, not lost
+        win._settings_save_timer.timeout.emit()
+
+        saved = mw.save_settings.call_args.args[0]
+        profile = saved.active_profile
+        assert (profile.max_temperature, profile.fft_preset, profile.seconds_per_core) == (100.0, "LARGE", 900)
+        tuner = TunerConfig.from_json(saved.tuner_config_json)
+        assert tuner.backend == "stress-ng"
+        assert tuner.max_thermal_retries == 7
+        win._history_db = None
+
+    def test_resume_does_not_overwrite_the_saved_tuner_panel(self, monkeypatch, tmp_path, db):
+        settings = _settings(tmp_path, tuner_config_json=TunerConfig(backend="stress-ng").to_json())
+        win = _build(monkeypatch, tmp_path, db=db, settings=settings)
+        tab = win._tuner_tab
+        # What Resume does with an mprime session: show its config in the panel.
+        tab._showing_session_config = True
+        try:
+            tab._apply_config_to_ui(TunerConfig(backend="mprime"))
+        finally:
+            tab._showing_session_config = False
+        assert tab._backend_combo.currentText() == "mprime"
+
+        win._config_tab._time_spin.setValue(901)  # an edit in the Config tab
+        win._settings_save_timer.timeout.emit()
+        assert TunerConfig.from_json(mw.save_settings.call_args.args[0].tuner_config_json).backend == "stress-ng"
+
+        win._persist_settings()  # what closeEvent does
+        assert TunerConfig.from_json(mw.save_settings.call_args.args[0].tuner_config_json).backend == "stress-ng"
+        win._history_db = None
+
+    def test_saved_settings_are_loaded_at_startup(self, monkeypatch, tmp_path, db):
+        from corecycler.config.settings import TestProfile
+
+        settings = _settings(
+            tmp_path,
+            profiles=[TestProfile(max_temperature=99.0, fft_preset="LARGE", test_mode="CUSTOM")],
+            tuner_config_json=TunerConfig(backend="stress-ng", max_thermal_retries=9).to_json(),
+        )
+        win = _build(monkeypatch, tmp_path, db=db, settings=settings)
+        assert win._config_tab.get_profile().max_temperature == 99.0
+        assert win._config_tab.get_profile().fft_preset == "LARGE"
+        assert win._tuner_tab._backend_combo.currentText() == "stress-ng"
+        assert win._tuner_tab._get_config().max_thermal_retries == 9
+        win._history_db = None
