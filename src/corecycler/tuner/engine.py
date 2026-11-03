@@ -607,9 +607,13 @@ class TunerEngine(QObject):
 
         self._run_next()
 
-    def resume(self, session_id: int) -> None:
+    def resume(self, session_id: int, *, max_temperature_c: float | None = None) -> None:
         """Resume a crashed/paused session: attribute any crash from evidence
-        first, then restore baselines, then continue where the cursor points."""
+        first, then restore baselines, then continue where the cursor points.
+
+        ``max_temperature_c`` (the GUI's Configuration-tab limit) replaces the
+        value saved in the session's config, so a changed limit applies to an
+        existing session too."""
         # A pause takes effect AFTER the in-flight test; resuming under a live
         # worker would rewrite SMU baselines beneath the running stress test
         # (false PASS at an untested offset) and orphan the worker thread.
@@ -637,6 +641,7 @@ class TunerEngine(QObject):
         self._config = TunerConfig.from_json(session.config_json)
         if self._smu is not None:
             self._config.clamp_max_offset(self._smu.commands.co_range)
+        self._override_max_temperature(max_temperature_c)
 
         # Fail closed on a corrupted/hand-edited config_json: from_json only
         # rejects wrong TYPES, so a well-typed but out-of-range value (e.g.
@@ -866,6 +871,16 @@ class TunerEngine(QObject):
             self.log_message.emit(f"Resumed session {session_id}")
             self._run_next()
 
+    def _override_max_temperature(self, max_temperature_c: float | None) -> None:
+        """Replace the saved thermal limit with the caller's current one."""
+        if max_temperature_c is None or max_temperature_c == self._config.max_temperature_c:
+            return
+        self.log_message.emit(
+            f"Max temperature: using {max_temperature_c:g} C from Configuration "
+            f"(session was saved with {self._config.max_temperature_c:g} C)"
+        )
+        self._config.max_temperature_c = max_temperature_c
+
     def pause(self) -> None:
         """Pause after the current test completes."""
         if self._session_id:
@@ -923,8 +938,10 @@ class TunerEngine(QObject):
                 tp.update_session_status(self._db, self._session_id, "aborted")
         self.log_message.emit("Tuner aborted")
 
-    def validate_profile(self, session_id: int) -> None:
-        """Re-test all confirmed values from a completed session."""
+    def validate_profile(self, session_id: int, *, max_temperature_c: float | None = None) -> None:
+        """Re-test all confirmed values from a completed session.
+
+        ``max_temperature_c`` overrides the saved limit, as in resume()."""
         if self._worker is not None and self._worker.isRunning():
             self.log_message.emit("Validate ignored: a test is still running — wait for it to finish.")
             return
@@ -953,6 +970,7 @@ class TunerEngine(QObject):
             self._config = TunerConfig.from_json(session.config_json)
             if self._smu is not None:
                 self._config.clamp_max_offset(self._smu.commands.co_range)
+            self._override_max_temperature(max_temperature_c)
             # Fail closed on a corrupted config_json, exactly as resume()/start().
             errors = self._config.validate()
             if errors:

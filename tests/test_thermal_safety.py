@@ -118,3 +118,23 @@ class TestThermalTunerConfig:
         restored = TunerConfig.from_json(c.to_json())
         assert restored.max_temperature_c == 88.0
         assert restored.max_thermal_retries == 5
+
+
+class TestMaxTemperatureCap:
+    """The configured limit can be raised for CPUs that regulate near 97 C,
+    but never above MAX_TEMPERATURE_LIMIT_C."""
+
+    def test_limit_above_cap_is_clamped(self):
+        from corecycler.engine.execution import MAX_TEMPERATURE_LIMIT_C
+
+        w = ThermalWatch(max_temperature=150.0, grace_seconds=0.0, hard_margin=8.0, require_sensor=False)
+        assert w.max_temperature == MAX_TEMPERATURE_LIMIT_C
+
+    def test_97c_is_safe_under_a_100c_limit(self):
+        w = _watch([97.0, 97.0, 97.0], max_temperature=100.0, grace_seconds=0.0)
+        assert w.max_temperature == 100.0
+        assert all(w.safe() for _ in range(3))
+
+    def test_tuner_config_accepts_100_and_rejects_above_cap(self):
+        assert TunerConfig(max_temperature_c=100.0).validate() == []
+        assert any("max_temperature_c" in e for e in TunerConfig(max_temperature_c=106.0).validate())

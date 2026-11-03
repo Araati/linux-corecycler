@@ -70,6 +70,11 @@ class SuperviseHooks:
     on_thermal: Callable[[float], None] | None = None
 
 
+# Highest max-temperature limit any caller may configure. Values above it are
+# clamped so a typo in a profile or tuner config cannot disable thermal safety.
+MAX_TEMPERATURE_LIMIT_C = 105.0
+
+
 class ThermalWatch:
     """Debounced soft limit, instant hard ceiling, hysteresis after a trip."""
 
@@ -84,7 +89,7 @@ class ThermalWatch:
         require_sensor: bool,
         read: Callable[[], float | None] | None = None,
     ) -> None:
-        self.max_temperature = max_temperature
+        self.max_temperature = min(max_temperature, MAX_TEMPERATURE_LIMIT_C)
         self.grace_seconds = grace_seconds
         self.hard_margin = hard_margin
         self.require_sensor = require_sensor

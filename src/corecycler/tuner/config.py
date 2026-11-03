@@ -7,6 +7,8 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 
+from corecycler.engine.execution import MAX_TEMPERATURE_LIMIT_C
+
 
 def _json_value_ok(default: object, value: object) -> bool:
     """True when a JSON-decoded value is type-compatible with a config field's
@@ -221,8 +223,8 @@ class TunerConfig:
                 errors.append(f"hardening_tiers[{i}] missing required keys: backend, stress_mode, fft_preset")
             elif tier.get("profile") not in (None, "sustained", "spectrum"):
                 errors.append(f"hardening_tiers[{i}] profile must be sustained or spectrum")
-        if not 60 <= self.max_temperature_c <= 110:
-            errors.append(f"max_temperature_c must be 60-110, got {self.max_temperature_c}")
+        if not 60 <= self.max_temperature_c <= MAX_TEMPERATURE_LIMIT_C:
+            errors.append(f"max_temperature_c must be 60-{MAX_TEMPERATURE_LIMIT_C:g}, got {self.max_temperature_c}")
         if self.over_temp_grace_seconds < 0:
             errors.append("over_temp_grace_seconds must be >= 0")
         if self.over_temp_hard_margin_c < 0:

@@ -215,6 +215,7 @@ class MainWindow(QMainWindow):
 
         smu = self._smu_tab.smu if hasattr(self._smu_tab, "smu") else None
         self._tuner_tab = TunerTab(self._history_db, self._topology, smu)
+        self._tuner_tab.set_max_temperature_source(lambda: self._config_tab.get_profile().max_temperature)
         self._tuner_tab.tuner_running_changed.connect(self._on_tuner_running_changed)
         self._tuner_tab.tuner_core_testing.connect(self._on_tuner_core_update)
         self._tuner_tab.tuner_core_elapsed.connect(self._on_tuner_core_elapsed)

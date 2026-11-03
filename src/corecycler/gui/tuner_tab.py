@@ -45,6 +45,8 @@ from corecycler.tuner.engine import TunerEngine
 from corecycler.tuner.state import TunerPhase
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from corecycler.engine.backends.base import StressBackend
     from corecycler.engine.topology import CPUTopology
     from corecycler.history.db import HistoryDB
@@ -81,6 +83,9 @@ class TunerTab(QWidget):
         self._backend_factory = backend_factory
         self._engine: TunerEngine | None = None
         self._selected_core: int | None = None
+        # Returns the Configuration tab's max temperature; set by MainWindow.
+        # None (standalone tab, tests) keeps the TunerConfig/session value.
+        self._max_temperature_source: Callable[[], float] | None = None
 
         self._tuner_timer = QTimer(self)
         self._tuner_timer.timeout.connect(self._tick_tuner)
@@ -415,8 +420,15 @@ class TunerTab(QWidget):
         btn_row.addStretch()
         parent_layout.addLayout(btn_row)
 
+    def set_max_temperature_source(self, source: Callable[[], float] | None) -> None:
+        """Use the Configuration tab's max temperature for every tuner run."""
+        self._max_temperature_source = source
+
+    def _max_temperature(self) -> float | None:
+        return self._max_temperature_source() if self._max_temperature_source else None
+
     def _get_config(self) -> TunerConfig:
-        return TunerConfig(
+        cfg = TunerConfig(
             start_offset=self._start_offset_spin.value(),
             coarse_step=self._coarse_step_spin.value(),
             fine_step=self._fine_step_spin.value(),
@@ -433,6 +445,10 @@ class TunerTab(QWidget):
             stress_mode=self._mode_combo.currentText(),
             fft_preset=self._fft_combo.currentText(),
         )
+        max_temp = self._max_temperature()
+        if max_temp is not None:
+            cfg.max_temperature_c = max_temp
+        return cfg
 
     def _load_defaults(self) -> None:
         self._apply_config_to_ui(TunerConfig())
@@ -660,7 +676,7 @@ class TunerTab(QWidget):
                 format_local(event.get("timestamp", "")),
                 event.get("message", ""),
             )
-        self._engine.resume(session_id)
+        self._engine.resume(session_id, max_temperature_c=self._max_temperature())
         if self._engine.status not in ACTIVE_STATUSES:
             QMessageBox.warning(
                 self,
@@ -694,7 +710,7 @@ class TunerTab(QWidget):
         backend = self._get_backend()
         if backend is None:
             return
-        self._engine.validate_profile(self._engine.session_id)
+        self._engine.validate_profile(self._engine.session_id, max_temperature_c=self._max_temperature())
         if self._engine.status not in ACTIVE_STATUSES:
             QMessageBox.warning(
                 self,

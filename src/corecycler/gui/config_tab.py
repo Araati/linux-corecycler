@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from corecycler.config.settings import TestProfile
 from corecycler.engine.backends.base import FFTPreset, StressMode
+from corecycler.engine.execution import MAX_TEMPERATURE_LIMIT_C
 from corecycler.gui.style import theme
 
 if TYPE_CHECKING:
@@ -156,7 +157,7 @@ class ConfigTab(QWidget):
         safety_layout = QFormLayout(safety_group)
 
         self._max_temp_spin = QDoubleSpinBox()
-        self._max_temp_spin.setRange(50.0, 115.0)
+        self._max_temp_spin.setRange(50.0, MAX_TEMPERATURE_LIMIT_C)
         self._max_temp_spin.setValue(95.0)
         self._max_temp_spin.setSuffix(" °C")
         self._max_temp_spin.setDecimals(1)

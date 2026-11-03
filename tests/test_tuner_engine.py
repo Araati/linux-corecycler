@@ -2826,3 +2826,25 @@ class TestEventLoopDeferral:
             eng._start_worker(99, 60)  # core 99 does not exist → start failure
         otf.assert_not_called()  # NOT re-entered synchronously
         qtimer.singleShot.assert_called_once()
+
+
+class TestMaxTemperatureOverride:
+    """The Configuration-tab limit replaces the value frozen in a saved session."""
+
+    def test_resume_uses_passed_max_temperature(self, db, simple_topology, mock_smu, mock_backend):
+        cfg = TunerConfig(cores_to_test=[0], search_duration_seconds=1, max_temperature_c=95.0)
+        eng = TunerEngine(db=db, topology=simple_topology, smu=mock_smu, backend=mock_backend, config=cfg)
+        sid = tp.create_session(db, cfg, "", "")
+        tp.save_core_state(db, sid, CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-10))
+        with patch.object(eng, "_run_next"):
+            eng.resume(sid, max_temperature_c=100.0)
+        assert eng._config.max_temperature_c == 100.0
+
+    def test_resume_without_override_keeps_saved_value(self, db, simple_topology, mock_smu, mock_backend):
+        cfg = TunerConfig(cores_to_test=[0], search_duration_seconds=1, max_temperature_c=90.0)
+        eng = TunerEngine(db=db, topology=simple_topology, smu=mock_smu, backend=mock_backend, config=cfg)
+        sid = tp.create_session(db, cfg, "", "")
+        tp.save_core_state(db, sid, CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-10))
+        with patch.object(eng, "_run_next"):
+            eng.resume(sid)
+        assert eng._config.max_temperature_c == 90.0

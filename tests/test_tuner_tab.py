@@ -69,3 +69,18 @@ class TestSelfPauseRecoverable:
         tab._on_status_changed("running")  # resumed again
         assert not tab._resume_btn.isEnabled()
         assert tab._pause_btn.isEnabled()
+
+
+class TestMaxTemperatureSource:
+    """The Auto-Tuner takes its thermal limit from the Configuration tab."""
+
+    def test_get_config_uses_configuration_tab_value(self):
+        from PySide6.QtWidgets import QApplication
+
+        from corecycler.gui.tuner_tab import TunerTab
+
+        assert QApplication.instance() or QApplication([])
+        tab = TunerTab(db=None, topology=None, smu=None)
+        assert tab._get_config().max_temperature_c == TunerConfig().max_temperature_c
+        tab.set_max_temperature_source(lambda: 100.0)
+        assert tab._get_config().max_temperature_c == 100.0

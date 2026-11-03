@@ -232,7 +232,7 @@ class TestResume:
         tab._engine = eng
         eng.status = "paused"
 
-        def _resumed(_session_id):
+        def _resumed(_session_id, **_kwargs):
             eng.status = "running"
 
         eng.resume.side_effect = _resumed
